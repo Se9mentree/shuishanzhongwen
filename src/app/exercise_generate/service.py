@@ -12,281 +12,20 @@ from typing import Optional, Tuple,Dict,Any,List
 import uuid
 import psycopg2
 import requests
-from fastapi import APIRouter, HTTPException
+from fastapi import HTTPException
 from pydantic import BaseModel, Field,validator
 from PIL import Image
 import random
-from app.utils.util import to_pinyin_sentence,segment_sentence
+from app.utils.util import to_pinyin_sentence,segment_sentence,generate_from_llm,generate_voice,generate_image,save_audio_asset,save_image_asset,get_text_to_image_task_status,_poll_image_task,segment_paragraph_to_sentences
+from app.utils.const import HSK_LEVEL_DESCRIPTIONS,TEXT_TYPE_INSTRUCTIONS,MEDIA_PUBLIC_BASE
+from app.exercise_generate.schema import (MatchReq,GenerateReq,ReadImageTfReq,WordOrderReq,ReadImageMatchReq,ReadingGapFillReq,ReadSentenceTfReq,SentenceTransReq,
+                                          ReadingDialogMatchReq,ReadParagraphComprReq,ListenSentenceTfReq,ReadSentenceCompChoReq,
+                                          MCReq,ListenSentenceQAReq,ListenDialogueQAReq,SentenceOrderReq)
 
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/data/media")
-MEDIA_PUBLIC_BASE = os.getenv("MEDIA_PUBLIC_BASE", "/media")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-APP_ID=os.getenv("APP_ID","")
-
-HSK_LEVEL_DESCRIPTIONS = {
-    1: "基础生活交流词汇与简单句",
-    2: "常见场景词汇与基本语法",
-    3: "一般话题表达，句式略复杂",
-    4: "较复杂句式与更广泛话题",
-    5: "较高难度词汇与长句表达",
-    6: "高级表达与复杂文本理解"
-}
-
-TEXT_TYPE_INSTRUCTIONS = {
-    "一句话": "生成一个简单、清晰、可视觉化的一句话陈述",
-    "两句话": "生成两句相关的简短陈述，便于视觉化",
-    "三句话": "生成三句简短且连贯的陈述"
-}
-
-
-def _sha256(b: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(b)
-    return h.hexdigest()
-
-def _date_parts():
-    d = datetime.utcnow()
-    return d.strftime("%Y"), d.strftime("%m"), d.strftime("%d")
-
-def _ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-def _guess_ext(mime_type: str, fallback: str) -> str:
-    ext = mimetypes.guess_extension(mime_type or "") or fallback
-    return {".jpe": ".jpg"}.get(ext, ext)
-
-def _db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL 未配置")
-    return psycopg2.connect(DATABASE_URL)
-
-def _ffprobe_duration_ms(abs_path: str) -> Optional[int]:
-    try:
-        out = subprocess.check_output([
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", abs_path
-        ], stderr=subprocess.DEVNULL)
-        dur = float(out.decode().strip())
-        return int(dur * 1000)
-    except Exception:
-        return None
-
-def save_image_asset(cur, data: bytes, mime_type: str) -> str:
-    """
-    将图片字节码保存到文件系统, 并在media_assets表中创建记录。
-    
-    Args:
-        cur: 数据库游标对象。
-        data: 图片的二进制数据。
-        mime_type: 图片的MIME类型。
-
-    Returns:
-        新创建的媒体资产在数据库中的UUID。
-    """
-    # 1. 保留原有的文件保存逻辑
-    sha = _sha256(data)
-    y, m, d = _date_parts()
-    prefix = sha[:2]
-    ext = _guess_ext(mime_type, ".jpg")
-    # 注意：我们存储的是相对路径，这与我们的方案B设计一致
-    rel_path = f"images/{y}/{m}/{d}/{prefix}/{sha}{ext}"
-    abs_path = os.path.join(MEDIA_ROOT, rel_path)
-    _ensure_dir(os.path.dirname(abs_path))
-    
-    img = Image.open(io.BytesIO(data))
-    w, h = img.size
-    with open(abs_path, "wb") as f:
-        f.write(data)
-
-    # 2. 【新增】将元数据存入数据库
-    # 使用 ON CONFLICT 可以在文件已存在时避免重复插入和报错，保证幂等性。
-    sql = """
-        INSERT INTO content_new.media_assets (file_url, file_type, mime_type, description)
-        VALUES (%s, 'image', %s, %s)
-        ON CONFLICT (file_url) DO UPDATE SET updated_at = NOW()
-        RETURNING id;
-    """
-    description = f"Image asset, SHA256: {sha}, Dimensions: {w}x{h}"
-    cur.execute(sql, (rel_path, mime_type, description))
-    media_asset_id = cur.fetchone()[0]
-
-    # 3. 【修改】返回数据库中的ID
-    return media_asset_id
-
-
-def save_audio_asset(cur, data: bytes, mime_type: str) -> str:
-    """
-    将音频字节码保存到文件系统, 并在media_assets表中创建记录。
-
-    Args:
-        cur: 数据库游标对象。
-        data: 音频的二进制数据。
-        mime_type: 音频的MIME类型。
-
-    Returns:
-        新创建的媒体资产在数据库中的UUID。
-    """
-    # 1. 保留原有的文件保存逻辑
-    sha = _sha256(data)
-    y, m, d = _date_parts()
-    prefix = sha[:2]
-    ext = _guess_ext(mime_type, ".mp3")
-    rel_path = f"audios/{y}/{m}/{d}/{prefix}/{sha}{ext}"
-    abs_path = os.path.join(MEDIA_ROOT, rel_path)
-    _ensure_dir(os.path.dirname(abs_path))
-    with open(abs_path, "wb") as f:
-        f.write(data)
-
-    # 2. 【新增】将元数据存入数据库
-    sql = """
-        INSERT INTO content_new.media_assets (file_url, file_type, mime_type, description)
-        VALUES (%s, 'audio', %s, %s)
-        ON CONFLICT (file_url) DO UPDATE SET updated_at = NOW()
-        RETURNING id;
-    """
-    description = f"Audio asset, SHA256: {sha}"
-    cur.execute(sql, (rel_path, mime_type, description))
-    media_asset_id = cur.fetchone()[0]
-
-    # 3. 【修改】返回数据库中的ID
-    return media_asset_id
-
-
-def generate_from_llm(prompt: str) -> str:
-    url = f"https://dashscope.aliyuncs.com/api/v1/apps/{APP_ID}/completion"
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "input": { "prompt": prompt },
-        "parameters": {},
-        "debug": {}
-    }
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(data))
-        response.raise_for_status()
-        result = response.json()
-        if 'output' in result and 'text' in result['output']:
-            return result['output']['text']
-        else:
-            return "API响应格式不正确，无法提取文本。"
-    except requests.exceptions.RequestException as e:
-        print(f"请求失败: {e}")
-        return "发生错误，无法生成文本。"
-    except json.JSONDecodeError:
-        print("API响应不是有效的JSON格式。")
-        return "发生错误，无法解析API响应。"
-
-def generate_voice(text: str) -> str:
-    if not LLM_API_KEY:
-        raise ValueError("请设置环境变量 DASHSCOPE_API_KEY")
-    url = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation' 
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "qwen-tts",
-        "input": { "text": text, "voice":"Chelsie" }
-    }
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()
-        result=response.json()
-        audio_url = result.get('output', {}).get('audio', {}).get('url')
-        if not audio_url:
-            raise RuntimeError("TTS 响应成功，但未找到音频 URL")
-        return audio_url
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"API 请求失败: {e}")
-
-def url_without_course(url: Optional[str]) -> Optional[str]:
-    return url
-
-def generate_image(prompt: str, negative: str):
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-        "X-DashScope-Async": "enable"
-    }
-    payload = {
-        "model": "wanx2.1-t2i-turbo",
-        "input": {
-            "prompt": prompt,
-            "negative_prompt": negative
-        },
-        "parameters": {
-            "size": "1024*1024",
-            "n": 1
-        }
-    }
-    try:
-        response = requests.post("https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis", headers=headers, data=json.dumps(payload))
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"提交文生图任务失败: {e}")
-
-def get_text_to_image_task_status(task_id: str):
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    status_url = f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}"
-    try:
-        response = requests.get(status_url, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"查询任务状态失败: {e}")
-
-async def _poll_image_task(task_id: str, max_try: int = 20, interval_s: float = 1.5) -> Optional[str]:
-    """轮询文生图任务直至拿到图片URL；失败/超时返回 None"""
-    for _ in range(max_try):
-        status = get_text_to_image_task_status(task_id)
-        out = status.get("output") or {}
-        if out.get("task_status") == "SUCCEEDED":
-            return (out.get("results") or [{}])[0].get("url")
-        if out.get("task_status") == "FAILED":
-            return None
-        await asyncio.sleep(interval_s)
-    return None
-
-
-class GenerateReq(BaseModel):
-    keyword: str
-    hskLevel: int = Field(..., ge=1, le=6)
-    isCorrect: bool = True
-    textType: str = "一句话"
-    lang: str = "zh-CN"
-    difficulty: int = Field(2, ge=1, le=5)
-    seed: Optional[int] = None
-
-class ListenImageTfResp(BaseModel):
-    exercise_id: str
-    hsk_level: int
-    difficulty: int
-    metadata: Dict[str, Any]
-    assets: Dict[str, str]
-
+#听录音，看图判断
 async def create_listen_image_tf_exercise(cur, req: GenerateReq) -> Dict[str, Any]:
-    """
-    创建一道“听录音,看图判断”题目，并将所有相关数据存入新数据库。
-    这是核心业务逻辑，与Web框架无关。
-
-    Args:
-        cur: 数据库游标对象。
-        req: API请求体，包含keyword, hskLevel等。
-
-    Returns:
-        一个字典，包含了新创建的题目的完整信息。
-    """
-    # === 第1步: 生成核心文本 ===
     hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
-    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get(req.textType, "生成一个简单的句子")
+    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get("一句话", "生成一个简单的句子")
     
     RIGHT_PROMPT_TEMPLATE = f"""
 作为一名顶尖的中文教学内容（CSL）设计师，请为“看图判断”题型创作一段高质量的中文文本。
@@ -419,35 +158,18 @@ async def create_listen_image_tf_exercise(cur, req: GenerateReq) -> Dict[str, An
         }
     }
 
-class MCReq(BaseModel):
-    correctKeyword: str
-    hskLevel: int = Field(..., ge=1, le=6)
-    textType: str = "一句话"
-    lang: str = "zh-CN"
-    difficulty: int = Field(2, ge=1, le=5)
-
-class MCResp(BaseModel):
-    # 注意：这个模型现在只用于路由层的响应类型提示，
-    # service函数本身可以返回一个更简单的字典
-    exercise_id: str
-    question_type: str
-    hsk_level: int
-    listening_text: str
-    audio_url: str # 这里应该是 asset_id
-    options: Dict[str, Dict[str, Any]]
-    correct_answer: str
-
+#听录音，看图选择
 async def create_listen_image_mc_exercise(cur, req: MCReq) -> Dict[str, Any]:
 
     # === 第1步: 生成核心听力文本 ===
     hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
-    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get(req.textType, "生成一个单一、完整的句子。")
+    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get("一句话", "生成一个单一、完整的句子。")
     RIGHT_PROMPT_TEMPLATE = f"""
 作为一名顶尖的中文教学内容（CSL）设计师，请为“听录音，看图选择”题型创作一段高质量的中文听力文本。
 - 核心词汇: 文本必须围绕 `{req.correctKeyword}` 展开。
 - 场景要求: 文本必须描述一个清晰、具体、单一、可以用图像轻松表现的场景或动作。
 - 目标等级: HSK {req.hskLevel} ({hskExplain})
-- 指定形式: {req.textType} ({textTypeExplain})
+- 指定形式: 一句话({textTypeExplain})
 - 输出格式: 只输出最终文本，不要任何解释或标签。
 """.strip()
     listening_text = generate_from_llm(RIGHT_PROMPT_TEMPLATE).strip()
@@ -580,31 +302,8 @@ async def create_listen_image_mc_exercise(cur, req: MCReq) -> Dict[str, Any]:
         "options": response_options,
         "correct_answer": correct_answer_label,
     }
-class MatchReq(BaseModel):
-    """听力·看图配对 —— 请求体"""
-    keywords: List[str]               # 至少 2~6 个关键词（每个关键词生成一条音频 + 一张图片）
-    hskLevel: int = Field(..., ge=1, le=6)
-    textType: str = "一句话"
-    lang: str = "zh-CN"
-    difficulty: int = Field(2, ge=1, le=5)
-    seed: Optional[int] = None        # 选填：用于固定打乱顺序的随机种子（可复现）
 
-class MatchResp(BaseModel):
-    """
-    听力·看图配对 —— 响应体（与 MCResp 风格一致：字段扁平、直出 URL、选项用 dict 按 label 索引）
-    - audios: 以 A/B/C... 为 key，value 含 子题ID/音频URL/（可选）文本
-    - images: 以 A/B/C... 为 key，value 含 图片URL
-    - answer_map: 标准答案映射（audio_label -> image_label）
-      （若学生端不应暴露答案，可在路由层移除该字段）
-    """
-    exercise_id: str
-    question_type: str = "听录音·看图配对"
-    hsk_level: int
-    difficulty: int
-    audios: Dict[str, Dict[str, Any]]
-    images: Dict[str, Dict[str, Any]]
-    answer_map: Dict[str, str]
-
+#听录音，看图配对
 async def create_listen_image_match_exercise(cur, req: MatchReq) -> Dict[str, Any]:
     """
     创建一套“听录音·看图配对”题目：
@@ -620,7 +319,7 @@ async def create_listen_image_match_exercise(cur, req: MatchReq) -> Dict[str, An
 
     # ---------- 1) 为每个关键词生成听力文本 ----------
     hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
-    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get(req.textType, "生成一个简单句子")
+    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get("一句话", "生成一个简单句子")
 
     listening_texts: List[str] = []
     for kw in keywords:
@@ -628,7 +327,7 @@ async def create_listen_image_match_exercise(cur, req: MatchReq) -> Dict[str, An
 作为中文教学内容设计师，请为“听录音·看图配对”题型生成一句听力文本。
 - 目标关键词: `{kw}`
 - HSK {req.hskLevel} ({hskExplain})
-- 指定形式: {req.textType}（{textTypeExplain}）
+- 指定形式: 一句话（{textTypeExplain}）
 - 要求: 文本自然、清晰，能被一张图片准确表达；避免多主体、多动作，避免抽象概念与时间线跳跃。
 - 输出: 只输出最终文本，不要任何解释或标点以外的附加符号。
 """.strip()
@@ -787,28 +486,7 @@ async def create_listen_image_match_exercise(cur, req: MatchReq) -> Dict[str, An
         "answer_map": answer_map
     }
 
-
-class ListenSentenceQAReq(BaseModel):
-    keyword: str                         # 关联系统词（用于 words 外键）
-    hskLevel: int = Field(..., ge=1, le=6)
-    textType: str = "一句话"              # 复用 TEXT_TYPE_INSTRUCTIONS
-    lang: str = "zh-CN"
-    difficulty: int = Field(2, ge=1, le=5)
-    optionCount: int = Field(3, ge=3, le=6)   # 选项数量，默认4
-    seed: Optional[int] = None                # 可选：控制选项打乱的随机种子
-
-
-class ListenSentenceQAResp(BaseModel):
-    exercise_id: str
-    question_type: str = "听录音·句子问答（单选）"
-    hsk_level: int
-    listening_text: str
-    question: str
-    question_pinyin:str
-    audio_url: str
-    options: Dict[str, Dict[str, Any]]        # {"A":{"text":"..."}, "B":{...}}
-    correct_answer: str                        # "A" / "B" / ...
-
+#听录音，句子问答（选择）
 async def create_listen_sentence_qa_exercise(cur, req: ListenSentenceQAReq) -> Dict[str, Any]:
     """
     创建一道“听录音·句子问答（选择题版）”
@@ -816,12 +494,12 @@ async def create_listen_sentence_qa_exercise(cur, req: ListenSentenceQAReq) -> D
     """
     # 1) 生成“听力文本”
     hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
-    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get(req.textType, "生成一个简单句子")
+    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get("一句话", "生成一个简单句子")
     L_TXT_PROMPT = f"""
 你是一名中文教学内容设计师，请为“听录音·句子问答（单选）”题型生成一句自然、清晰、易朗读的中文句子。
 - 主题词: `{req.keyword}`
 - HSK {req.hskLevel}（{hskExplain}）
-- 形式: {req.textType}（{textTypeExplain}）
+- 形式: 一句话（{textTypeExplain}）
 - 要求: 句子应包含可据此发问的明确事实（如人物/时间/地点/动作/数量等）。
 - 输出: 只输出该句子本身。
 """.strip()
@@ -965,28 +643,7 @@ async def create_listen_sentence_qa_exercise(cur, req: ListenSentenceQAReq) -> D
         "correct_answer": correct_label
     }
 
-
-class ListenSentenceTfReq(BaseModel):
-    keyword: str                         # 关联系统词（用于 words 外键）
-    hskLevel: int = Field(..., ge=1, le=6)
-    isCorrect: bool = True               # True: 陳述与音频一致；False: 作为干扰项
-    textType: str = "一句话"              # 复用 TEXT_TYPE_INSTRUCTIONS
-    lang: str = "zh-CN"
-    difficulty: int = Field(2, ge=1, le=5)
-    seed: Optional[int] = None           # 可选：若后续需要复现随机性
-
-class ListenSentenceTfResp(BaseModel):
-    exercise_id: str
-    question_type: str = "听录音·句子判断"
-    hsk_level: int
-    difficulty: int
-    listening_text: str                  # 音频对应文本（如需隐藏，路由层去掉即可）
-    statement: str
-    statement_pinyin:str                       # 用于判断的文本陈述
-    audio_url: str                       # 题干音频 URL
-    correct_answer: bool                 # 标准答案（True/False）
-
-
+#听录音，句子判断
 async def create_listen_sentence_tf_exercise(cur, req: ListenSentenceTfReq) -> Dict[str, Any]:
     """
     创建一道“听录音·句子判断”题：
@@ -998,12 +655,12 @@ async def create_listen_sentence_tf_exercise(cur, req: ListenSentenceTfReq) -> D
     """
     # 1) 生成听力文本
     hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
-    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get(req.textType, "生成一个简单、清晰的句子")
+    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get("一句话", "生成一个简单、清晰的句子")
     L_PROMPT = f"""
 你是一名严谨的中文教学内容设计师，请为“听录音·句子判断”题型生成一句自然、完整、易朗读的中文句子。
 - 主题词: `{req.keyword}`
 - HSK {req.hskLevel}（{hskExplain}）
-- 形式: {req.textType}（{textTypeExplain}）
+- 形式: 一句话（{textTypeExplain}）
 - 要求: 句子包含可核对的事实信息（人物/时间/地点/动作/数量等），避免含糊或多义。
 - 输出: 只输出该句子本身。
 """.strip()
@@ -1092,23 +749,7 @@ async def create_listen_sentence_tf_exercise(cur, req: ListenSentenceTfReq) -> D
         "correct_answer": bool(req.isCorrect)
     }
 
-
-class ReadImageTfReq(BaseModel):
-    keyword: str
-    hskLevel: int = Field(..., ge=1, le=2)
-    isCorrect: bool = True           
-    difficulty: int = Field(2, ge=1, le=5)
-
-class ReadImageTfResp(BaseModel):
-    exercise_id: str
-    question_type: str = "阅读·图片·判断"
-    hsk_level: int
-    difficulty: int
-    word: str
-    pinyin: str
-    image_url: str
-    correct_answer: bool
-
+#阅读，看图判断
 async def create_read_image_tf_exercise(cur, req: ReadImageTfReq) -> Dict[str, Any]:
     """
     创建一道 阅读·图片·判断 题：
@@ -1200,34 +841,7 @@ async def create_read_image_tf_exercise(cur, req: ReadImageTfReq) -> Dict[str, A
         "correct_answer": bool(req.isCorrect)
     }
 
-
-
-class ReadImageMatchReq(BaseModel):
-    keywords: List[str]                 # 3–5 个词语
-    hskLevel: int = Field(..., ge=1, le=6)
-    difficulty: int = Field(2, ge=1, le=5)
-    seed: Optional[int] = None          # 控制乱序的随机种子（可复现）
-
-    @validator("keywords")
-    def _check_len(cls, v):
-        if not v or not (3 <= len(v) <= 5):
-            raise ValueError("阅读·看图配对必须提供 3–5 个关键词")
-        if any((not isinstance(w, str) or not w.strip()) for w in v):
-            raise ValueError("关键词不能为空字符串")
-        return [w.strip() for w in v]
-
-class ReadImageMatchResp(BaseModel):
-    exercise_id: str
-    question_type: str = "阅读·看图配对"
-    hsk_level: int
-    difficulty: int
-    texts: Dict[str, Dict[str, Any]]
-    images: Dict[str, Dict[str, Any]]
-
-    answer_map: Dict[str, str]
-
-
-
+#阅读，看图配对
 async def create_read_image_match_exercise(cur, req: ReadImageMatchReq) -> Dict[str, Any]:
     """
     创建一套“阅读·看图配对（3–5项）”题：
@@ -1363,34 +977,7 @@ async def create_read_image_match_exercise(cur, req: ReadImageMatchReq) -> Dict[
         "answer_map": answer_map
     }
 
-
-
-
-class ReadingDialogMatchReq(BaseModel):
-    keyword: str
-    numPairs: int = Field(..., ge=3, le=6)      # 3~6 组
-    hskLevel: int = Field(..., ge=1, le=6)
-    difficulty: int = Field(2, ge=1, le=5)
-    lang: str = "zh-CN"
-    seed: Optional[int] = None                  # 固定乱序（可复现）
-
-    @validator("keyword")
-    def _kw_non_empty(cls, v):
-        if not v or not v.strip():
-            raise ValueError("keyword 不能为空")
-        return v.strip()
-
-class ReadingDialogMatchResp(BaseModel):
-    question_type: str = "阅读·对话配对"
-    hsk_level: int
-    difficulty: int
-    shuffled_questions: Dict[str, Dict[str, str]]   # {"A":{"text":"...","pinyin":"..."}}
-    shuffled_answers: Dict[str, Dict[str, str]]     # {"B":{"text":"...","pinyin":"..."}}
-    answers: Dict[str, str]                         # {"A":"C", ...}  左label -> 右label
-    exercise_id: str
-
-
-
+#阅读，对话配对
 async def create_reading_dialog_matching(cur, req: ReadingDialogMatchReq):
     """
     生成【阅读·对话配对】并落库（新库版：content_new.*）。
@@ -1528,24 +1115,7 @@ async def create_reading_dialog_matching(cur, req: ReadingDialogMatchReq):
         exercise_id=exercise_id,
     )
 
-class ReadingGapFillReq(BaseModel):
-    keyword: str                         # 主题词/限定词
-    hskLevel: int = Field(..., ge=1, le=6)
-    difficulty: int = Field(2, ge=1, le=5)
-    optionCount: int = 3  
-    lang: str = "zh-CN"
-    seed: Optional[int] = None
-
-
-class ReadingGapFillResp(BaseModel):
-    exercise_id: str
-    question_type: str = "阅读·选词填空"
-    hsk_level: int
-    difficulty: int
-    sentence_with_blank: str                 # 例：我 想 __ 一杯茶。
-    options: Dict[str, Dict[str, str]]       # {"A":{"text":"点","pinyin":"diǎn"}, ...}
-    correct_answer: str                      # 例："B"
-
+#选词填空（需要修改）
 async def create_reading_gap_fill_exercise(cur, req: ReadingGapFillReq) -> Dict[str, Any]:
     """
     生成【阅读·选词填空】并落库（content_new.*）
@@ -1681,22 +1251,7 @@ async def create_reading_gap_fill_exercise(cur, req: ReadingGapFillReq) -> Dict[
         "correct_answer": correct_label
     }
 
-
-
-class SentenceTransReq(BaseModel):
-    keyword: str                          # 关联词（强制要求在 words 表存在）
-    hskLevel: int = Field(..., ge=1, le=6)
-    difficulty: int = Field(2, ge=1, le=5)
-    seed: Optional[int] = None            # 预留，可做随机性控制（此题型用不到也可记录）
-
-class SentenceTransResp(BaseModel):
-    exercise_id: str
-    question_type: str = "阅读·句子翻译"
-    hsk_level: int
-    difficulty: int
-    sentence_cn: str
-    sentence_en: str
-
+#句子翻译
 async def create_sentence_translation_exercise(cur, req: SentenceTransReq) -> Dict[str, Any]:
     """
     生成【阅读·句子翻译】并落库：
@@ -1781,25 +1336,7 @@ async def create_sentence_translation_exercise(cur, req: SentenceTransReq) -> Di
         "sentence_en": sentence_en
     }
 
-
-
-class ReadSentenceCompChoReq(BaseModel):
-    keyword: str
-    hskLevel: int = Field(..., ge=1, le=6)
-    difficulty: int = Field(2, ge=1, le=5)
-    seed: Optional[int] = None          
-
-class ReadSentenceCompChoResp(BaseModel):
-    exercise_id: str
-    question_type: str = "阅读·句子理解"
-    hsk_level: int
-    difficulty: int
-    passage: str
-    question: str
-    options: Dict[str, Dict[str, str]]  # {"A":{"text":"..."}, "B":{"text":"..."}, "C":{"text":"..."}}
-    correct_answer: str                  # "A"/"B"/"C"
-
-
+#阅读，句子理解选择
 async def create_read_sentence_comprehension_choice_exercise(cur, req: ReadSentenceCompChoReq) -> Dict[str, Any]:
     """
     生成【阅读·句子理解】并落库：
@@ -1927,22 +1464,8 @@ async def create_read_sentence_comprehension_choice_exercise(cur, req: ReadSente
         "options": options,                 # 'options' 字典现在已经包含了拼音
         "correct_answer": correct_label
     }
-class ReadSentenceTfReq(BaseModel):
-    keyword: str
-    hskLevel: int = Field(..., ge=1, le=6)
-    difficulty: int = Field(2, ge=1, le=5)
-    isCorrect: Optional[bool] = None
-    seed: Optional[int] = None
 
-class ReadSentenceTfResp(BaseModel):
-    exercise_id: str
-    question_type: str = "阅读·句子判断"
-    hsk_level: int
-    difficulty: int
-    passage: str
-    statement: str
-    correct_answer: bool
-
+#阅读，句子判断
 async def create_read_sentence_tf_exercise(cur, req: ReadSentenceTfReq) -> Dict[str, Any]:
     """
     生成【阅读·句子判断】并落库（content_new.*）
@@ -2046,30 +1569,7 @@ async def create_read_sentence_tf_exercise(cur, req: ReadSentenceTfReq) -> Dict[
         "correct_answer": bool(is_correct)
     }
 
-
-class ReadParagraphComprReq(BaseModel):
-    topic: str
-    hskLevel: int = Field(..., ge=1, le=6)
-    difficulty: int = Field(2, ge=1, le=5)
-    textLength: int = Field(100, ge=50, le=400)   # 文章目标字数（±10%）
-    numQuestions: int = Field(3, ge=1, le=8)      # 生成题目数量
-    seed: Optional[int] = None                    # 控制整体和选项打乱
-
-class RPQuestionItem(BaseModel):
-    sub_exercise_id: str
-    stem: str
-    options: Dict[str, Dict[str, str]]            # {"A":{"text":"..."}, ...}
-    correct_answer: str                           # "A"~"D"
-
-class ReadParagraphComprResp(BaseModel):
-    exercise_id: str
-    question_type: str = "阅读·段落理解"
-    hsk_level: int
-    difficulty: int
-    passage: str
-    highlighted_word: Optional[str] = None        # 文章中被 /.../ 包裹的词（若存在）
-    questions: List[RPQuestionItem]
-
+#阅读，段落理解选择(大题)
 async def create_read_paragraph_comprehension_exercise(cur, req: ReadParagraphComprReq) -> Dict[str, Any]:
     """
     生成【阅读·段落理解（多题）】并落库（content_new.*）
@@ -2242,28 +1742,7 @@ async def create_read_paragraph_comprehension_exercise(cur, req: ReadParagraphCo
         questions=sub_items
     ).dict()
 
-
-class WordOrderReq(BaseModel):
-    keyword: str
-    hskLevel: int = Field(..., ge=1, le=6)
-    difficulty: int = Field(2, ge=1, le=5)
-    lang: str = "zh-CN"
-    seed: Optional[int] = None
-    minPieces: int = Field(3, ge=2, le=10)
-    maxPieces: int = Field(7, ge=3, le=12)
-
-class WordOrderResp(BaseModel):
-    exercise_id: str
-    question_type: str = "阅读·连词成句"
-    hsk_level: int
-    difficulty: int
-    # 乱序展示：每个词片含 id / text / pinyin
-    pieces: Dict[str, Dict[str, str]]           # {"A":{"id":"...","text":"...","pinyin":"..."}}
-    # 正确顺序：按“标签”的顺序 or 直接返回按原顺序的 piece_id 列表（更稳）
-    answer_order: List[str]                      # 例如 ["C","A","B","D"]
-    answer_ids: List[str]                        # 例如 ["id3","id1","id2","id4"]
-    sentence: str                                # 可在学生端隐藏
-
+#连词成句
 async def create_word_order_exercise(cur, req: WordOrderReq) -> Dict[str, Any]:
     """
     阅读·连词成句（带拼音）：
@@ -2387,10 +1866,431 @@ async def create_word_order_exercise(cur, req: WordOrderReq) -> Dict[str, Any]:
     }
 
 
+#听录音，对话问答（选择）
+async def create_listen_dialogue_qa_exercise(cur, req: ListenDialogueQAReq) -> Dict[str, Any]:
+    """
+    创建一道“听录音·对话问答（选择题版）”
+    流程：生成对话内容 -> 生成单选题(题干+正确项+干扰项) -> 生成TTS并落库 -> 插入题目与媒体 -> 返回响应
+    """
+    # 1) 生成“听力文本”
+    hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
+    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get("一段对话")
+    L_TXT_PROMPT = f"""
+你是一名中文教学内容设计师，请为“听录音·对话问答（单选）”题型生成一句自然、清晰、易朗读的双人中文对话。
+- 主题词: `{req.keyword}`
+- HSK {req.hskLevel}（{hskExplain}）
+- 形式: 一段对话（{textTypeExplain}）
+- 要求: 对话应包含可据此发问的明确事实（如人物/时间/地点/动作/数量等）。
+- 输出: 只输出该对话本身。
+""".strip()
+    listening_text = generate_from_llm(L_TXT_PROMPT).strip()
+    if not listening_text:
+        raise ValueError("AI 生成听力文本失败")
+
+    # 2) 基于听力文本生成【题干 + 正确项 + 干扰项们】
+    #   让大模型一次输出结构化 JSON，便于解析
+    n_opts = int(req.optionCount)
+    QA_PROMPT = f"""
+基于下列中文句子，设计一道“单选题”以考查对该句子的理解：
+- 句子: "{listening_text}"
+- 题干要求: 提出一个仅凭该对话即可回答的单问题（谁/什么/何时/哪里/多少/为何/怎样等），不可开放式。
+- 选项要求: 总共 {n_opts} 个；其中 1 个正确项 + {n_opts-1} 个干扰项；
+  干扰项需“同一语义范畴、与句子贴近但不成立/不一致”，不能出现“以上都对/都不对/无法判断”这类选项。
+- 输出 JSON（仅此结构，不要额外文字）：
+{{
+  "question": "……",
+  "correct": "……",
+  "distractors": ["……","……", "..."]   // 恰好 {n_opts-1} 个
+}}
+""".strip()
+    qa_raw = generate_from_llm(QA_PROMPT).strip()
+    try:
+        qa = json.loads(qa_raw)
+        question = str(qa["question"]).strip()
+        correct_text = str(qa["correct"]).strip()
+        distractors = [str(x).strip() for x in qa["distractors"]]
+        if not question or not correct_text:
+            raise ValueError("题干或正确项为空")
+        if not isinstance(distractors, list) or len(distractors) != (n_opts - 1):
+            raise ValueError(f"干扰项数量应为 {n_opts-1}")
+        # 合法性小校验：不得包含完全相同文本
+        all_texts = [correct_text] + distractors
+        if len(set(all_texts)) != len(all_texts):
+            raise ValueError("选项包含重复文本，请重试生成")
+    except Exception as e:
+        raise ValueError(f"AI 生成选择题 JSON 解析失败: {e}")
+    
+    question_pinyin = to_pinyin_sentence(question)
+    correct_text_pinyin = to_pinyin_sentence(correct_text)
+    distractors_pinyin = [to_pinyin_sentence(d) for d in distractors]
+
+    # 3) 生成并保存音频（对“听力文本”进行TTS）
+    audio_temp_url = generate_voice(listening_text)
+    r = requests.get(audio_temp_url, timeout=30)
+    r.raise_for_status()
+    audio_bytes = r.content
+    audio_mime = r.headers.get("Content-Type", "audio/mpeg").split(";")[0]
+    audio_asset_id = save_audio_asset(cur, audio_bytes, audio_mime)
+
+    # 4) 外键 & 题型检查
+    # 4.1 word
+    cur.execute("SELECT id FROM content_new.words WHERE characters = %s;", (req.keyword,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"词库中不存在词语: {req.keyword}")
+    word_id = row[0]
+
+    # 4.2 exercise_type
+    ex_type_name = "LISTEN_DIALOGUE_QA"
+    cur.execute("SELECT id FROM content_new.exercise_types WHERE name=%s;", (ex_type_name,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"题型库中不存在题型: {ex_type_name}")
+    exercise_type_id = row[0]
+
+    # 5) 生成选项并打乱，确定正确标签
+    options_texts: List[str] = [correct_text] + distractors
+    rnd = random.Random(req.seed) if req.seed is not None else random
+    rnd.shuffle(options_texts)
+
+    labels = [chr(ord('A') + i) for i in range(n_opts)]
+    label_to_text = {labels[i]: options_texts[i] for i in range(n_opts)}
+    # 找出正确项的 label
+    correct_label = None
+    for lab, txt in label_to_text.items():
+        if txt == correct_text:
+            correct_label = lab
+            break
+    if not correct_label:
+        raise RuntimeError("未能确定正确选项标签")
+
+    # 6) 写 exercises（本题不需要子题）
+    exercise_id = str(uuid.uuid4())
+    all_texts = [correct_text] + distractors
+    all_pinyins = [correct_text_pinyin] + distractors_pinyin
+    text_to_pinyin_map = dict(zip(all_texts, all_pinyins))
+    metadata = {
+        "listening_text": listening_text,
+        "question": question,
+        "question_pinyin": question_pinyin,              # 新增
+        "options": [
+            {
+                "label": lab, 
+                "text": label_to_text[lab],
+                "pinyin": text_to_pinyin_map.get(label_to_text[lab], "") # 新增
+            } for lab in labels
+        ],
+        "correct_label": correct_label,
+        "seed": req.seed
+    }
+    cur.execute(
+        """
+        INSERT INTO content_new.exercises
+            (id, word_id, exercise_type_id, prompt, metadata, difficulty_level)
+        VALUES (%s, %s, %s, %s, %s, %s);
+        """,
+        (exercise_id, word_id, exercise_type_id,
+         "请先听录音，然后选择正确答案。", json.dumps(metadata), req.difficulty)
+    )
+
+    # 7) 关联音频
+    cur.execute(
+        "INSERT INTO content_new.exercise_media_assets (exercise_id, media_asset_id, usage_role) VALUES (%s, %s, 'prompt_audio');",
+        (exercise_id, audio_asset_id)
+    )
+
+    # 8) 拼 URL & 组装响应（与 MCResp 风格一致）
+    cur.execute("SELECT file_url FROM content_new.media_assets WHERE id=%s;", (audio_asset_id,))
+    file_url = (cur.fetchone() or [""])[0]
+    audio_url = f"{MEDIA_PUBLIC_BASE}/{file_url}"
+
+    options_dict = {
+        lab: {
+            "text": label_to_text[lab],
+            "pinyin": text_to_pinyin_map.get(label_to_text[lab], "") # 新增
+        } for lab in labels
+    }
+
+    return {
+        "exercise_id": exercise_id,
+        "question_type": "听录音·对话问答（单选）",
+        "hsk_level": req.hskLevel,
+        "listening_text": listening_text,
+        "question": question,
+        "question_pinyin": question_pinyin,             # 新增
+        "audio_url": audio_url,
+        "options": options_dict,
+        "correct_answer": correct_label
+    }
+
+#听录音,段落问答（选择）
+async def create_listen_paragraph_qa_exercise(cur, req: ListenDialogueQAReq) -> Dict[str, Any]:
+    """
+    创建一道“听录音·对话问答（选择题版）”
+    流程：生成一段话 -> 生成单选题(题干+正确项+干扰项) -> 生成TTS并落库 -> 插入题目与媒体 -> 返回响应
+    """
+    # 1) 生成“听力文本”
+    hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
+    textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get("一段话")
+    L_TXT_PROMPT = f"""
+你是一名中文教学内容设计师，请为“听录音·段落问答（单选）”题型生成一句自然、清晰、易朗读的双人中文短文。
+- 主题词: `{req.keyword}`
+- HSK {req.hskLevel}（{hskExplain}）
+- 形式: 一段话（{textTypeExplain}）
+- 要求: 对话应包含可据此发问的明确事实（如人物/时间/地点/动作/数量等）。
+- 输出: 只输出该段落本身。
+""".strip()
+    listening_text = generate_from_llm(L_TXT_PROMPT).strip()
+    if not listening_text:
+        raise ValueError("AI 生成听力文本失败")
+
+    # 2) 基于听力文本生成【题干 + 正确项 + 干扰项们】
+    #   让大模型一次输出结构化 JSON，便于解析
+    n_opts = int(req.optionCount)
+    QA_PROMPT = f"""
+基于下列中文句子，设计一道“单选题”以考查对该句子的理解：
+- 句子: "{listening_text}"
+- 题干要求: 提出一个仅凭该段落即可回答的单问题（谁/什么/何时/哪里/多少/为何/怎样等），不可开放式。
+- 选项要求: 总共 {n_opts} 个；其中 1 个正确项 + {n_opts-1} 个干扰项；
+  干扰项需“同一语义范畴、与句子贴近但不成立/不一致”，不能出现“以上都对/都不对/无法判断”这类选项。
+- 输出 JSON（仅此结构，不要额外文字）：
+{{
+  "question": "……",
+  "correct": "……",
+  "distractors": ["……","……", "..."]   // 恰好 {n_opts-1} 个
+}}
+""".strip()
+    qa_raw = generate_from_llm(QA_PROMPT).strip()
+    try:
+        qa = json.loads(qa_raw)
+        question = str(qa["question"]).strip()
+        correct_text = str(qa["correct"]).strip()
+        distractors = [str(x).strip() for x in qa["distractors"]]
+        if not question or not correct_text:
+            raise ValueError("题干或正确项为空")
+        if not isinstance(distractors, list) or len(distractors) != (n_opts - 1):
+            raise ValueError(f"干扰项数量应为 {n_opts-1}")
+        # 合法性小校验：不得包含完全相同文本
+        all_texts = [correct_text] + distractors
+        if len(set(all_texts)) != len(all_texts):
+            raise ValueError("选项包含重复文本，请重试生成")
+    except Exception as e:
+        raise ValueError(f"AI 生成选择题 JSON 解析失败: {e}")
+    
+    question_pinyin = to_pinyin_sentence(question)
+    correct_text_pinyin = to_pinyin_sentence(correct_text)
+    distractors_pinyin = [to_pinyin_sentence(d) for d in distractors]
+
+    # 3) 生成并保存音频（对“听力文本”进行TTS）
+    audio_temp_url = generate_voice(listening_text)
+    r = requests.get(audio_temp_url, timeout=30)
+    r.raise_for_status()
+    audio_bytes = r.content
+    audio_mime = r.headers.get("Content-Type", "audio/mpeg").split(";")[0]
+    audio_asset_id = save_audio_asset(cur, audio_bytes, audio_mime)
+
+    # 4) 外键 & 题型检查
+    # 4.1 word
+    cur.execute("SELECT id FROM content_new.words WHERE characters = %s;", (req.keyword,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"词库中不存在词语: {req.keyword}")
+    word_id = row[0]
+
+    # 4.2 exercise_type
+    ex_type_name = "LISTEN_PARAGRAPH_QA"
+    cur.execute("SELECT id FROM content_new.exercise_types WHERE name=%s;", (ex_type_name,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"题型库中不存在题型: {ex_type_name}")
+    exercise_type_id = row[0]
+
+    # 5) 生成选项并打乱，确定正确标签
+    options_texts: List[str] = [correct_text] + distractors
+    rnd = random.Random(req.seed) if req.seed is not None else random
+    rnd.shuffle(options_texts)
+
+    labels = [chr(ord('A') + i) for i in range(n_opts)]
+    label_to_text = {labels[i]: options_texts[i] for i in range(n_opts)}
+    # 找出正确项的 label
+    correct_label = None
+    for lab, txt in label_to_text.items():
+        if txt == correct_text:
+            correct_label = lab
+            break
+    if not correct_label:
+        raise RuntimeError("未能确定正确选项标签")
+
+    # 6) 写 exercises（本题不需要子题）
+    exercise_id = str(uuid.uuid4())
+    all_texts = [correct_text] + distractors
+    all_pinyins = [correct_text_pinyin] + distractors_pinyin
+    text_to_pinyin_map = dict(zip(all_texts, all_pinyins))
+    metadata = {
+        "listening_text": listening_text,
+        "question": question,
+        "question_pinyin": question_pinyin,              # 新增
+        "options": [
+            {
+                "label": lab, 
+                "text": label_to_text[lab],
+                "pinyin": text_to_pinyin_map.get(label_to_text[lab], "") # 新增
+            } for lab in labels
+        ],
+        "correct_label": correct_label,
+        "seed": req.seed
+    }
+    cur.execute(
+        """
+        INSERT INTO content_new.exercises
+            (id, word_id, exercise_type_id, prompt, metadata, difficulty_level)
+        VALUES (%s, %s, %s, %s, %s, %s);
+        """,
+        (exercise_id, word_id, exercise_type_id,
+         "请先听录音，然后选择正确答案。", json.dumps(metadata), req.difficulty)
+    )
+
+    # 7) 关联音频
+    cur.execute(
+        "INSERT INTO content_new.exercise_media_assets (exercise_id, media_asset_id, usage_role) VALUES (%s, %s, 'prompt_audio');",
+        (exercise_id, audio_asset_id)
+    )
+
+    # 8) 拼 URL & 组装响应（与 MCResp 风格一致）
+    cur.execute("SELECT file_url FROM content_new.media_assets WHERE id=%s;", (audio_asset_id,))
+    file_url = (cur.fetchone() or [""])[0]
+    audio_url = f"{MEDIA_PUBLIC_BASE}/{file_url}"
+
+    options_dict = {
+        lab: {
+            "text": label_to_text[lab],
+            "pinyin": text_to_pinyin_map.get(label_to_text[lab], "") # 新增
+        } for lab in labels
+    }
+
+    return {
+        "exercise_id": exercise_id,
+        "question_type": "听录音·段落问答（单选）",
+        "hsk_level": req.hskLevel,
+        "listening_text": listening_text,
+        "question": question,
+        "question_pinyin": question_pinyin,             # 新增
+        "audio_url": audio_url,
+        "options": options_dict,
+        "correct_answer": correct_label
+    }
 
 
+#连句成段
+async def create_sentence_order_exercise(cur, req: SentenceOrderReq) -> Dict[str, Any]:
+    """
+    阅读·连句成段（带拼音）：
+      1) LLM 生成与 keyword 相关的一个短段落
+      2) segment_paragraph_to_sentences() 切分句子
+      3) 为每个句子计算拼音
+      4) 乱序并落库（content_new.exercises，题型 READ_SENTENCE_ORDER）
+      5) 返回：乱序句子(含拼音) + 正确顺序（标签 & id）
+    """
+    kw = (req.keyword or "").strip()
+    if not kw:
+        raise ValueError("keyword 不能为空")
+    hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
+
+    # 1) 生成句子
+    prompt = f"""
+请用中文写一句与“{kw}”相关的自然口语化短文，适用于HSK{req.hskLevel}（{hskExplain}）。
+- 要求：段落内部逻辑连贯（如按时间、因果顺序），句子之间界限清晰。
+- 格式：每个句子必须以“。”、“！”或“？”结尾。
+- 输出：仅输出这段话本身。
+""".strip()
+    sentence = generate_from_llm(prompt).strip()
+    if not sentence:
+        raise HTTPException(status_code=500, detail="AI 生成句子失败")
+
+    # 2) 切词
+    try:
+        segs: List[str] = [s.strip() for s in segment_paragraph_to_sentences(sentence) if s and s.strip()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"segment_sentence 执行失败: {e}")
 
 
+    if len(segs) < 2:
+        raise HTTPException(status_code=500, detail="切分结果不足以组成题目")
 
+    # 3) 逐句拼音
+    def word_pinyin(tok: str) -> str:
+        # 你已有的 to_pinyin_sentence 通常支持整句，这里逐词调用即可
+        return to_pinyin_sentence(tok)
+
+    pieces_original = [
+        {"id": str(uuid.uuid4()), "text": segs[i], "pinyin": word_pinyin(segs[i])}
+        for i in range(len(segs))
+    ]
+    answer_ids = [p["id"] for p in pieces_original]  # 原顺序的 id 列表（最稳的答案表示）
+
+    # 4) 乱序展示
+    rnd = random.Random(req.seed) if req.seed is not None else random
+    shuffled = pieces_original[:]
+    rnd.shuffle(shuffled)
+
+    labels = [chr(ord("A") + i) for i in range(len(shuffled))]  # A..?
+    pieces_dict: Dict[str, Dict[str, str]] = {
+        labels[i]: {"id": shuffled[i]["id"], "text": shuffled[i]["text"], "pinyin": shuffled[i]["pinyin"]}
+        for i in range(len(shuffled))
+    }
+
+    # 5) 根据“原顺序 id”反查在乱序中的 label，得到 label 版答案（便于前端比对）
+    id_to_label = {v["id"]: k for k, v in pieces_dict.items()}
+    answer_order = [id_to_label[p["id"]] for p in pieces_original]
+
+    # 6) 题型/词语外键并落库（强制父题关联词语）
+    # 6.1 题型
+    cur.execute("SELECT id FROM content_new.exercise_types WHERE name=%s;", ("READ_SENTENCE_ORDER",))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail="题型 READ_SENTENCE_ORDER 未初始化，请先在 exercise_types 中插入。")
+    exercise_type_id = row[0]
+
+    # 6.2 词语（强制）
+    cur.execute("SELECT id FROM content_new.words WHERE characters=%s;", (kw,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail=f"词库中不存在词语：{kw}")
+    word_id = row[0]
+
+    # 6.3 落库（单题，无子题/无媒体）
+    exercise_id = str(uuid.uuid4())
+    metadata = {
+        "keyword": kw,
+        "paragraph": sentence,
+        "pieces_original": pieces_original,                 # [{id,text,pinyin}...]
+        "pieces_shuffled_label_map": pieces_dict,           # {A:{id,text,pinyin}...}
+        "answer_order": answer_order,                       # 标签答案（便于前端）
+        "answer_ids": answer_ids,                           # id 答案（最稳）
+        "seed": req.seed
+    }
+    cur.execute("""
+        INSERT INTO content_new.exercises
+            (id, word_id, exercise_type_id, prompt, metadata, difficulty_level)
+        VALUES (%s, %s, %s, %s, %s, %s);
+    """, (
+        exercise_id,
+        word_id,
+        exercise_type_id,
+        "请将下列句子按正确顺序排列成段。",
+        json.dumps(metadata),
+        req.difficulty
+    ))
+
+    return {
+        "exercise_id": exercise_id,
+        "question_type": "阅读·连句成段",
+        "hsk_level": req.hskLevel,
+        "difficulty": req.difficulty,
+        "pieces": pieces_dict,            # 含 pinyin
+        "answer_order": answer_order,     # 标签序
+        "answer_ids": answer_ids,         # id 序
+        "sentence": sentence
+    }
 
 

@@ -17,7 +17,9 @@ class WordOrderItem(BaseModel):
     label: str
     text: str = Field(..., alias="word")
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
-
+class SentenceOrderItem(BaseModel):
+    label: str
+    text: str  
 
 class ListenImageTrueFalseContent(BaseModel): prompt: str; audioUrl: Optional[str]; listeningText: str; imageUrl: Optional[str]
 class ReadImageTrueFalseContent(BaseModel): prompt: str; statement: str; imageUrl: Optional[str]
@@ -34,6 +36,18 @@ class ReadWordOrderContent(BaseModel):
     prompt: str
     items: List[WordOrderItem] = Field(..., alias="words")
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+class ReadParagraphSubQuestionContent(BaseModel):
+    prompt: str
+    passage: str  
+    highlightedWord: Optional[str] = None
+    question: str 
+    options: List[Dict[str, str]] = Field(..., description="选项列表，例如 [{'label':'A', 'text':'...'}]")
+
+class ReadSentenceOrderContent(BaseModel):
+    prompt: str
+    items: List[SentenceOrderItem] = Field(..., alias="sentences") # 定义一个更语义化的别名
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
 
 
 class ListenImageTrueFalseExercise(BaseModel): exerciseId: str; exerciseType: Literal["LISTEN_IMAGE_TRUE_FALSE"]; content: ListenImageTrueFalseContent; correctAnswer: bool
@@ -53,6 +67,30 @@ class ReadWordOrderExercise(BaseModel):
     content: ReadWordOrderContent
     correctAnswer: List[str]
 
+class RpSubQuestion(BaseModel):
+    subExerciseId:str=Field(...,description="子题ID")
+class ReadParagraphSubQuestionExercise(BaseModel):
+    exerciseId: str 
+    exerciseType: Literal["READ_PARAGRAPH_COMPREHENSION"]
+    content: ReadParagraphSubQuestionContent
+    correctAnswer: str = Field(..., description="正确答案的标签, 例如 'A'")
+class ListenDialogueQaExercise(BaseModel):
+    exerciseId: str
+    exerciseType: Literal["LISTEN_DIALOGUE_QA"]
+    content: ListenSentenceQaContent  
+    correctAnswer: str
+
+class ListenParagraphQaExercise(BaseModel):
+    exerciseId: str
+    exerciseType: Literal["LISTEN_PARAGRAPH_QA"]
+    content: ListenSentenceQaContent  # 复用完全相同的 content 结构
+    correctAnswer: str
+
+class ReadSentenceOrderExercise(BaseModel):
+    exerciseId: str
+    exerciseType: Literal["READ_SENTENCE_ORDER"]
+    content: ReadSentenceOrderContent
+    correctAnswer: List[str]
 
 AnyExercise = Union[
     ListenImageTrueFalseExercise,
@@ -66,7 +104,11 @@ AnyExercise = Union[
     ListenImageMatchExercise,
     ReadImageMatchExercise,
     ReadDialogueMatchExercise,
-    ReadWordOrderExercise
+    ReadWordOrderExercise,
+    ReadParagraphSubQuestionExercise,
+    ListenDialogueQaExercise,
+    ListenParagraphQaExercise ,
+    ReadSentenceOrderExercise
 ]
 
 class ExerciseResponse(BaseModel):

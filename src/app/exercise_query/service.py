@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from . import schemas, crud, models
 from .formatter import format_exercises_for_api, build_public_url   # ← 新增 build_public_url
-from app.utils.avg_time import AVERAGE_DURATIONS_PER_TYPE
+from app.utils.const import AVERAGE_DURATIONS_PER_TYPE
 
 MAX_QUESTIONS_LIMIT = 50
 
@@ -23,172 +23,161 @@ def _calculate_average_duration(requested_types: List[str]) -> float:
     return total / len(requested_types)
 
 
-def _reconstruct_matching_exercises(
+def _reconstruct_composite_exercises(
     db: Session,
     exercises: List[models.Exercise],
-    base_url: Optional[str] = None,   # ← 新增：把 base_url 透传进来用于拼绝对 URL
+    base_url: Optional[str] = None,
 ) -> List[models.Exercise]:
     """
-    遍历题目列表，识别配对题的子题，重组成父题结构以供 formatter 使用。
-    这是解决所有配对题查询问题的核心。
-    这里也一并把所有媒体 URL（图片/音频）转换为“可公网访问的绝对 URL”。
+    遍历题目列表，识别并重组复合题。
+    - 对于配对题：将子题组合成一个父题，并返回父题。
+    - 对于段落理解题：将父题的文章信息分发给每个子题，返回一个扁平化的子题列表。
     """
     reconstructed_list: List[models.Exercise] = []
     processed_parent_ids = set()
     MATCHING_TYPES = {"LISTEN_IMAGE_MATCH", "READ_IMAGE_MATCH", "READ_DIALOGUE_MATCH"}
+    COMPREHENSION_TYPE = "READ_PARAGRAPH_COMPREHENSION"
 
     for exercise in exercises:
         ex_type_name = exercise.type.name if exercise.type else ""
 
-        # 处理三类配对题（存在 parent_exercise_id 的子题）
-        if ex_type_name in MATCHING_TYPES and exercise.parent_exercise_id:
-            parent_id = exercise.parent_exercise_id
+        # 识别两种需要特殊处理的复合题
+        is_matching_child = ex_type_name in MATCHING_TYPES and exercise.parent_exercise_id
+        is_comprehension_parent = ex_type_name == COMPREHENSION_TYPE and not exercise.parent_exercise_id
+
+        if is_matching_child or is_comprehension_parent:
+            # 统一获取父题ID
+            parent_id = exercise.parent_exercise_id if is_matching_child else exercise.id
 
             if parent_id in processed_parent_ids:
                 continue
 
+            # 一次性高效查询父题及其所有子题
             parent_exercise = crud.get_parent_exercise_with_all_children(db, parent_id)
-            if not parent_exercise or not parent_exercise.children:
+            if not parent_exercise:
                 continue
-
-            # 关键修正(1): 必须使用 display_order 对子题排序，以确保原始配对关系正确
+            
+            # 标记父题已处理，避免重复工作
+            processed_parent_ids.add(parent_id)
+            
+            # 始终按 display_order 排序子题，确保顺序正确
             sorted_children = sorted(parent_exercise.children, key=lambda x: x.display_order)
 
-            parent_meta = parent_exercise.meta or {}
-            seed = parent_meta.get("seed")
-            rnd = random.Random(seed) if seed is not None else random
+            # --- 逻辑分支：根据题型决定是“组合”还是“分发” ---
 
-            reconstructed_meta = {}
+            # 1. 段落理解题：分发父题信息，返回子题列表
+            if ex_type_name == COMPREHENSION_TYPE:
+                if not sorted_children:
+                    continue # 如果父题下没有子题，则跳过
 
-            # A) 听图配对 / 读图配对
-            if ex_type_name == "LISTEN_IMAGE_MATCH" or ex_type_name == "READ_IMAGE_MATCH":
-                left_items, right_items = [], []
-                for sub_ex in sorted_children:
-                    sub_meta = sub_ex.meta or {}
-                    # 使用 usage_role 建立媒体映射
-                    media_map = {
-                        link.usage_role: link.media_asset
-                        for link in sub_ex.media_links
-                        if link.media_asset
+                parent_meta = parent_exercise.meta or {}
+                passage = parent_meta.get("passage", "")
+                highlighted_word = parent_meta.get("highlighted_word")
+
+                for child in sorted_children:
+                    # 将父题的文章信息和子题自身的信息合并
+                    child_meta = child.meta or {}
+                    enriched_meta = {
+                        **child_meta,
+                        "passage": passage,
+                        "highlighted_word": highlighted_word
                     }
+                    child.meta = enriched_meta
+                    # 将“增强后”的子题直接添加到最终列表中
+                    reconstructed_list.append(child)
 
-                    # 左列：听力音频 或 文本
-                    if ex_type_name == "LISTEN_IMAGE_MATCH" and "prompt_audio" in media_map:
-                        # 用 build_public_url 拼绝对 URL（不再硬编码 "/media/..."）
-                        audio_url = build_public_url(
-                            media_map["prompt_audio"].file_url, base_url
-                        )
-                        left_items.append(
-                            {
+            # 2. 配对题：组合子题信息，返回单个父题
+            elif ex_type_name in MATCHING_TYPES:
+                if not sorted_children:
+                    continue
+                
+                # --- 以下是您提供的原始配对题处理逻辑，保持不变 ---
+                parent_meta = parent_exercise.meta or {}
+                seed = parent_meta.get("seed")
+                rnd = random.Random(seed) if seed is not None else random
+                reconstructed_meta = {}
+
+                # A) 听图配对 / 读图配对
+                if ex_type_name == "LISTEN_IMAGE_MATCH" or ex_type_name == "READ_IMAGE_MATCH":
+                    left_items, right_items = [], []
+                    for sub_ex in sorted_children:
+                        sub_meta = sub_ex.meta or {}
+                        media_map = {
+                            link.usage_role: link.media_asset
+                            for link in sub_ex.media_links
+                            if link.media_asset
+                        }
+
+                        if ex_type_name == "LISTEN_IMAGE_MATCH" and "prompt_audio" in media_map:
+                            audio_url = build_public_url(media_map["prompt_audio"].file_url, base_url)
+                            left_items.append({
                                 "audioUrl": audio_url,
                                 "listeningText": sub_meta.get("listening_text", ""),
-                            }
-                        )
-                    elif ex_type_name == "READ_IMAGE_MATCH":
-                        left_items.append(
-                            {
+                            })
+                        elif ex_type_name == "READ_IMAGE_MATCH":
+                            left_items.append({
                                 "text": sub_meta.get("word", ""),
                                 "pinyin": sub_meta.get("pinyin", ""),
-                            }
-                        )
+                            })
 
-                    # 右列：正确图片
-                    if "correct_image" in media_map:
-                        image_url = build_public_url(
-                            media_map["correct_image"].file_url, base_url
-                        )
-                        right_items.append({"imageUrl": image_url})
+                        if "correct_image" in media_map:
+                            image_url = build_public_url(media_map["correct_image"].file_url, base_url)
+                            right_items.append({"imageUrl": image_url})
 
-                # 结构合法性检查
-                if len(left_items) != len(right_items) or not left_items:
-                    continue
+                    if len(left_items) != len(right_items) or not left_items:
+                        continue
 
-                n = len(left_items)
-                labels = [chr(ord("A") + i) for i in range(n)]
-                left_indices, right_indices = list(range(n)), list(range(n))
-                rnd.shuffle(left_indices)
-                rnd.shuffle(right_indices)
+                    n = len(left_items)
+                    labels = [chr(ord("A") + i) for i in range(n)]
+                    left_indices, right_indices = list(range(n)), list(range(n))
+                    rnd.shuffle(left_indices)
+                    rnd.shuffle(right_indices)
 
-                final_left = [
-                    {"label": labels[i], **left_items[left_indices[i]]} for i in range(n)
-                ]
-                final_right = [
-                    {"label": labels[i], **right_items[right_indices[i]]} for i in range(n)
-                ]
-                answer_map = {
-                    labels[left_indices.index(i)]: labels[right_indices.index(i)]
-                    for i in range(n)
-                }
+                    final_left = [{"label": labels[i], **left_items[left_indices[i]]} for i in range(n)]
+                    final_right = [{"label": labels[i], **right_items[right_indices[i]]} for i in range(n)]
+                    answer_map = {labels[left_indices.index(i)]: labels[right_indices.index(i)] for i in range(n)}
 
-                if ex_type_name == "LISTEN_IMAGE_MATCH":
+                    if ex_type_name == "LISTEN_IMAGE_MATCH":
+                        reconstructed_meta = {"audios": final_left, "images": final_right, "answer_map": answer_map}
+                    else:
+                        reconstructed_meta = {"texts": final_left, "images": final_right, "answer_map": answer_map}
+
+                # B) 对话配对
+                elif ex_type_name == "READ_DIALOGUE_MATCH":
+                    questions, answers = [], []
+                    for sub_ex in sorted_children:
+                        sub_meta = sub_ex.meta or {}
+                        questions.append({"text": sub_meta.get("utterance"), "pinyin": sub_meta.get("utter_pinyin")})
+                        answers.append({"text": sub_meta.get("reply"), "pinyin": sub_meta.get("reply_pinyin")})
+
+                    if not questions or len(questions) != len(answers):
+                        continue
+
+                    n = len(questions)
+                    labels = [chr(ord("A") + i) for i in range(n)]
+                    q_indices, a_indices = list(range(n)), list(range(n))
+                    rnd.shuffle(q_indices)
+                    rnd.shuffle(a_indices)
+
+                    shuffled_questions = [{"label": labels[i], **questions[q_indices[i]]} for i in range(n)]
+                    shuffled_answers = [{"label": labels[i], **answers[a_indices[i]]} for i in range(n)]
+                    answer_map = {labels[q_indices.index(i)]: labels[a_indices.index(i)] for i in range(n)}
+
                     reconstructed_meta = {
-                        "audios": final_left,
-                        "images": final_right,
-                        "answer_map": answer_map,
-                    }
-                else:
-                    reconstructed_meta = {
-                        "texts": final_left,
-                        "images": final_right,
-                        "answer_map": answer_map,
+                        "shuffled_questions": shuffled_questions,
+                        "shuffled_answers": shuffled_answers,
+                        "answers": answer_map,
                     }
 
-            # B) 对话配对
-            elif ex_type_name == "READ_DIALOGUE_MATCH":
-                questions, answers = [], []
-                for sub_ex in sorted_children:
-                    sub_meta = sub_ex.meta or {}
-                    questions.append(
-                        {
-                            "text": sub_meta.get("utterance"),
-                            "pinyin": sub_meta.get("utter_pinyin"),
-                        }
-                    )
-                    answers.append(
-                        {
-                            "text": sub_meta.get("reply"),
-                            "pinyin": sub_meta.get("reply_pinyin"),
-                        }
-                    )
+                # 回写父题 meta，并记录
+                parent_exercise.meta = reconstructed_meta
+                reconstructed_list.append(parent_exercise)
 
-                if not questions or len(questions) != len(answers):
-                    continue
-
-                n = len(questions)
-                labels = [chr(ord("A") + i) for i in range(n)]
-                q_indices, a_indices = list(range(n)), list(range(n))
-                rnd.shuffle(q_indices)
-                rnd.shuffle(a_indices)
-
-                shuffled_questions = [
-                    {"label": labels[i], **questions[q_indices[i]]} for i in range(n)
-                ]
-                shuffled_answers = [
-                    {"label": labels[i], **answers[a_indices[i]]} for i in range(n)
-                ]
-
-                # 关键修正(2): 使用与图片配对题一致的、更健壮的答案生成逻辑
-                answer_map = {
-                    labels[q_indices.index(i)]: labels[a_indices.index(i)] for i in range(n)
-                }
-
-                reconstructed_meta = {
-                    "shuffled_questions": shuffled_questions,
-                    "shuffled_answers": shuffled_answers,
-                    "answers": answer_map,
-                }
-
-            # 回写父题 meta，并记录
-            parent_exercise.meta = reconstructed_meta
-            reconstructed_list.append(parent_exercise)
-            processed_parent_ids.add(parent_id)
-
-        # 普通题（没有 parent_exercise_id）直接加入
-        elif not exercise.parent_exercise_id:
+        # 普通题（既不是复合题的父题，也不是其子题）直接加入
+        elif not exercise.parent_exercise_id and ex_type_name != COMPREHENSION_TYPE:
             reconstructed_list.append(exercise)
 
     return reconstructed_list
-
 
 def create_exercise_session(
     db: Session,
@@ -223,7 +212,7 @@ def create_exercise_session(
         return {}
 
     # 配对题重构（并在此阶段把媒体 URL 转为绝对 URL）
-    reconstructed_candidates = _reconstruct_matching_exercises(
+    reconstructed_candidates = _reconstruct_composite_exercises(
         db, candidate_exercises, base_url=base_url
     )
 

@@ -1,5 +1,3 @@
-# file: question/formatter.py
-
 from typing import List, Optional, Any
 from . import models
 from . import schemas
@@ -161,11 +159,13 @@ def format_exercises_for_api(
 
         elif ex_type in [
             "LISTEN_SENTENCE_QA",
+            "LISTEN_DIALOGUE_QA",
+            "LISTEN_PARAGRAPH_QA",
             "READ_SENTENCE_COMPREHENSION_CHOICE",
             "READ_WORD_GAP_FILL",
         ]:
             options = [schemas.McOptionText(**opt) for opt in metadata.get("options", [])]
-            if ex_type == "LISTEN_SENTENCE_QA":
+            if ex_type in ["LISTEN_SENTENCE_QA","LISTEN_DIALOGUE_QA","LISTEN_PARAGRAPH_QA"]:
                 content = schemas.ListenSentenceQaContent(
                     prompt=exercise.prompt or "",
                     audioUrl=media_map.get("prompt_audio"),
@@ -173,12 +173,31 @@ def format_exercises_for_api(
                     question=metadata.get("question", ""),
                     options=options,
                 )
-                formatted_list.append(
-                    schemas.ListenSentenceQaExercise(
-                        exerciseId=str(exercise.id),
-                        exerciseType=ex_type,
-                        content=content,
-                        correctAnswer=metadata.get("correct_label", ""),
+                if ex_type=="LISTEN_SENTENCE_QA":
+                    formatted_list.append(
+                        schemas.ListenSentenceQaExercise(
+                            exerciseId=str(exercise.id),
+                            exerciseType=ex_type,
+                            content=content,
+                            correctAnswer=metadata.get("correct_label", ""),
+                    )
+                )
+                elif ex_type=="LISTEN_DIALOGUE_QA":
+                    formatted_list.append(
+                        schemas.ListenDialogueQaExercise(
+                            exerciseId=str(exercise.id),
+                            exerciseType=ex_type,
+                            content=content,
+                            correctAnswer=metadata.get("correct_label", ""),
+                    )
+                )
+                elif ex_type=="LISTEN_PARAGRAPH_QA":
+                    formatted_list.append(
+                        schemas.ListenParagraphQaExercise(
+                            exerciseId=str(exercise.id),
+                            exerciseType=ex_type,
+                            content=content,
+                            correctAnswer=metadata.get("correct_label", ""),
                     )
                 )
             elif ex_type == "READ_SENTENCE_COMPREHENSION_CHOICE":
@@ -346,5 +365,94 @@ def format_exercises_for_api(
                     correctAnswer=correct_answer_numeric,
                 )
             )
+        
+        elif ex_type == "READ_SENTENCE_ORDER":
+            meta = metadata or {}
+            label_map = meta.get("pieces_shuffled_label_map", None)
+            shuffled_list = meta.get("pieces_shuffled", None)
+            answer_ids = meta.get("answer_ids", None)
+            answer_order = meta.get("answer_order", None)
 
+            items = []
+            correct_answer_numeric: List[str] = []
+
+            if label_map:
+                labels = sorted(label_map.keys())
+                label_to_numeric = {lab: str(i + 1) for i, lab in enumerate(labels)}
+                id_to_numeric = {}
+
+                for i, lab in enumerate(labels, start=1):
+                    piece = label_map.get(lab, {}) or {}
+                    pid = piece.get("id") or ""
+                    txt = piece.get("text", "")
+                    id_to_numeric[pid] = str(i)
+                    items.append(
+                        schemas.SentenceOrderItem(
+                            label=str(i),
+                            text=txt
+                        )
+                    )
+                if answer_ids:
+                    correct_answer_numeric = [id_to_numeric.get(pid, "") for pid in answer_ids]
+                elif answer_order:
+                    correct_answer_numeric = [label_to_numeric.get(lab, "") for lab in answer_order]
+
+                correct_answer_numeric = [x for x in correct_answer_numeric if x]
+
+            elif shuffled_list:
+                id_to_numeric = {}
+                for i, piece in enumerate(shuffled_list, start=1):
+                    pid = piece.get("id") or ""
+                    txt = piece.get("text", "")
+                    id_to_numeric[pid] = str(i)
+                    items.append(
+                        schemas.SentenceOrderItem(
+                            label=str(i),
+                            **{"word": txt}
+                        )
+                    )
+                if answer_ids:
+                    correct_answer_numeric = [id_to_numeric.get(pid, "") for pid in answer_ids]
+                    correct_answer_numeric = [x for x in correct_answer_numeric if x]
+                elif answer_order:
+                    labels = [chr(ord("A") + i) for i in range(len(shuffled_list))]
+                    label_to_numeric = {lab: str(i + 1) for i, lab in enumerate(labels)}
+                    correct_answer_numeric = [label_to_numeric.get(lab, "") for lab in answer_order]
+                    correct_answer_numeric = [x for x in correct_answer_numeric if x]
+
+            prompt_text = (
+                exercise.prompt
+                or meta.get("paragraph")
+                or "请将下列句子按正确顺序排列成段落"
+            )
+
+            content = schemas.ReadSentenceOrderContent(
+                prompt=prompt_text,
+                **{"sentences": items}
+            )
+            formatted_list.append(
+                schemas.ReadSentenceOrderExercise(
+                    exerciseId=str(exercise.id),
+                    exerciseType=ex_type,
+                    content=content,
+                    correctAnswer=correct_answer_numeric,
+                )
+            )
+        
+        elif ex_type=="READ_PARAGRAPH_COMPREHENSION":
+            content=schemas.ReadParagraphSubQuestionContent(
+                prompt=exercise.prompt or "根据文章内容，选择最佳答案",
+                passage=metadata.get("passage",""),
+                highlightedWord=metadata.get("highlighted_word"),
+                question=metadata.get("question", ""), 
+                options=metadata.get("options", [])    
+            )
+            formatted_list.append(
+                schemas.ReadParagraphSubQuestionExercise(
+                exerciseId=str(exercise.id),
+                exerciseType=ex_type,
+                content=content,
+                correctAnswer=metadata.get("correct_label","")
+            )
+        )
     return formatted_list

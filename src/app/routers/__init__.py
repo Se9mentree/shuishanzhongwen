@@ -7,7 +7,7 @@
 """
 
 from app.features import auth_router, user_router
-from .generator_router import router as generator_router
+from app.exercise_generate.router import router as generator_router
 from app.exercise_query.router import router as exercise_query_router
 
 # 所有启用的路由
