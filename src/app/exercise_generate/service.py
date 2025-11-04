@@ -20,7 +20,7 @@ from app.utils.util import to_pinyin_sentence,segment_sentence,generate_from_llm
 from app.utils.const import HSK_LEVEL_DESCRIPTIONS,TEXT_TYPE_INSTRUCTIONS,MEDIA_PUBLIC_BASE
 from app.exercise_generate.schema import (MatchReq,GenerateReq,ReadImageTfReq,WordOrderReq,ReadImageMatchReq,ReadingGapFillReq,ReadSentenceTfReq,SentenceTransReq,
                                           ReadingDialogMatchReq,ReadParagraphComprReq,ListenSentenceTfReq,ReadSentenceCompChoReq,
-                                          MCReq,ListenSentenceQAReq,ListenDialogueQAReq,SentenceOrderReq)
+                                          MCReq,ListenSentenceQAReq,ListenDialogueQAReq,SentenceOrderReq,SpeakAlongReq,RPQuestionItem,ReadingDialogMatchResp,ReadParagraphComprResp)
 
 #听录音，看图判断
 async def create_listen_image_tf_exercise(cur, req: GenerateReq) -> Dict[str, Any]:
@@ -311,14 +311,34 @@ async def create_listen_image_match_exercise(cur, req: MatchReq) -> Dict[str, An
     - N 个子题（每个关键词 → 一条听力 + 一张正确图片）
     - 返回与 MatchResp 完全对齐的结构（audios/images/answer_map）
     """
-    # ---------- 0) 基础校验 ----------
-    if not req.keywords or len(req.keywords) < 2 or len(req.keywords) > 6:
-        raise ValueError("配对题关键词数量必须在 2~6 之间")
-    # 复制一份，避免后续意外修改
-    keywords = list(req.keywords)
+    base_keyword = req.keyword.strip()
+    if not base_keyword:
+        raise ValueError("keyword 不能为空")
 
-    # ---------- 1) 为每个关键词生成听力文本 ----------
+    # 根据 seed 初始化随机数生成器，以确保配对数量可复现
+    _rnd = random.Random(req.seed) if req.seed is not None else random
+    num_pairs = _rnd.randint(3, 5) # 随机 4, 5, 或 6
+    num_to_generate = num_pairs - 1
+
     hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
+    DISTRACTOR_PROMPT = f"""
+作为一名中文试题设计师，请为“听录音·看图配对”题型生成相关词语。
+- 核心词: `{base_keyword}` (HSK {req.hskLevel}, {hskExplain})
+- 任务: 生成 {num_to_generate} 个与核心词【相关但不同】的词语，用于制作配对题。
+- 要求: 词语必须具体、易于通过图片和一句话来表达。
+- 输出格式: 仅输出一个 JSON 数组，例如：["词语1", "词语2", "词语3"]
+""".strip()
+    
+    raw_distractors = generate_from_llm(DISTRACTOR_PROMPT).strip()
+    try:
+        generated_keywords = json.loads(raw_distractors)
+        if not isinstance(generated_keywords, list) or len(generated_keywords) < num_to_generate:
+            raise ValueError(f"LLM 未能生成足够的相关词 (需要 {num_to_generate} 个)")
+    except Exception as e:
+        raise ValueError(f"AI 生成相关词失败或JSON格式错误: {e}")
+    keywords = [base_keyword] + generated_keywords[:num_to_generate]
+
+
     textTypeExplain = TEXT_TYPE_INSTRUCTIONS.get("一句话", "生成一个简单句子")
 
     listening_texts: List[str] = []
@@ -403,9 +423,7 @@ async def create_listen_image_match_exercise(cur, req: MatchReq) -> Dict[str, An
         # 5.1 词库外键（可为空；你的业务若要求必须存在，这里抛错）
         cur.execute("SELECT id FROM content_new.words WHERE characters = %s;", (kw,))
         word_row = cur.fetchone()
-        if not word_row:
-            raise ValueError(f"词库中不存在词语: {kw}")
-        word_id = word_row[0]
+        word_id = word_row[0] if word_row else None
 
         # 5.2 子题记录
         sub_id = str(uuid.uuid4())
@@ -849,7 +867,35 @@ async def create_read_image_match_exercise(cur, req: ReadImageMatchReq) -> Dict[
       - N 个子题：每个词 -> 拼音 + 正确图片（usage_role='correct_image'）
       - 返回与 ReadImageMatchResp 完全匹配（texts/images/answer_map）
     """
-    words: List[str] = req.keywords
+    base_keyword = req.keyword.strip()
+    if not base_keyword:
+        raise ValueError("keyword 不能为空")
+
+    _rnd = random.Random(req.seed) if req.seed is not None else random
+    num_pairs = _rnd.randint(3, 5) # 随机 4, 5, 或 6
+    num_to_generate = num_pairs - 1
+
+    hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
+    
+    DISTRACTOR_PROMPT = f"""
+作为一名中文试题设计师，请为“阅读·看图配对”题型生成相关词语。
+- 核心词: `{base_keyword}` (HSK {req.hskLevel}, {hskExplain})
+- 任务: 生成 {num_to_generate} 个与核心词【相关但不同】的词语。
+- 要求: 词语必须具体、易于通过图片来表达。
+- 输出格式: 仅输出一个 JSON 数组，例如：["词语1", "词语2", "词语3"]
+""".strip()
+    
+    raw_distractors = generate_from_llm(DISTRACTOR_PROMPT).strip()
+    try:
+        generated_keywords = json.loads(raw_distractors)
+        if not isinstance(generated_keywords, list) or len(generated_keywords) < num_to_generate:
+            raise ValueError(f"LLM 未能生成足够的相关词 (需要 {num_to_generate} 个)")
+    except Exception as e:
+        raise ValueError(f"AI 生成相关词失败或JSON格式错误: {e}")
+
+    # 组合成最终的关键词列表
+    # (使用 'words' 变量名以匹配函数体后续代码)
+    words = [base_keyword] + generated_keywords[:num_to_generate]
     n = len(words)
 
     # 1) 生成拼音（使用你提供的 to_pinyin_sentence）
@@ -883,13 +929,19 @@ async def create_read_image_match_exercise(cur, req: ReadImageMatchReq) -> Dict[
         raise ValueError(f"题型库中不存在题型: {ex_type_name}")
     exercise_type_id = row[0]
 
-    word_ids: List[str] = []
+    word_ids: List[Optional[str]] = [] 
     for w in words:
         cur.execute("SELECT id FROM content_new.words WHERE characters = %s;", (w,))
         row = cur.fetchone()
+        
         if not row:
-            raise ValueError(f"词库中不存在词语: {w}")
-        word_ids.append(row[0])
+            # 词库中不存在该词 (例如 AI 生成的词)
+            # 我们不再抛出错误，而是添加 None，因为 exercises.word_id 允许为空
+            print(f"[警告] 词库中不存在词语: '{w}'。该子题的 word_id 将设为 NULL。")
+            word_ids.append(None)
+        else:
+            # 词库中存在，正常添加 UUID
+            word_ids.append(row[0])
 
     # 4) 插入父题
     parent_exercise_id = str(uuid.uuid4())
@@ -1049,9 +1101,7 @@ async def create_reading_dialog_matching(cur, req: ReadingDialogMatchReq):
         # 4.0 强制：父题必须关联 words 表
         cur.execute("SELECT id FROM content_new.words WHERE characters=%s;", (req.keyword,))
         row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=400, detail=f"词库中不存在词语：{req.keyword}（父题要求强制关联 words）")
-        word_id = row[0]
+        word_id = row[0] if row else None
 
         # 4.1 查题型
         cur.execute("SELECT id FROM content_new.exercise_types WHERE name=%s;", ("READ_DIALOGUE_MATCH",))
@@ -1093,6 +1143,7 @@ async def create_reading_dialog_matching(cur, req: ReadingDialogMatchReq):
             """, (
                 sub_id,
                 exercise_id,
+                None,
                 exercise_type_id,
                 "匹配对话",
                 json.dumps(sub_meta),
@@ -1118,12 +1169,13 @@ async def create_reading_dialog_matching(cur, req: ReadingDialogMatchReq):
 #选词填空（需要修改）
 async def create_reading_gap_fill_exercise(cur, req: ReadingGapFillReq) -> Dict[str, Any]:
     """
-    生成【阅读·选词填空】并落库（content_new.*）
-    - LLM 产出一句自然中文句子（包含 keyword 语境）
-    - LLM 指定挖空词并给出同类干扰项
+    生成【阅读·选词填空（多空版）】并落库（content_new.*）
+    - [同步版本] 调用 LLM 产出一句带 2-3 个空格的中文句子
+    - LLM 为每个空格提供 1 个正确词 + 3 个干扰项
     - 计算所有选项拼音（to_pinyin_sentence）
     - 父题：content_new.exercises（READ_WORD_GAP_FILL）
-    - 返回：句子+空格、选项(含拼音)、正确标签
+    - metadata 存储新的 JSON 结构
+    - 返回与用户指定 JSON 匹配的响应
     """
     kw = req.keyword.strip()
     if not kw:
@@ -1131,98 +1183,116 @@ async def create_reading_gap_fill_exercise(cur, req: ReadingGapFillReq) -> Dict[
 
     hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
 
-    # 1) 生成基础句子
-    sent_prompt = f"""
-请用中文写一句自然、口语化、长度不超过20个汉字的句子，适用于HSK{req.hskLevel}（{hskExplain}），
-与“{kw}”相关，但不要出现生僻词与人名地名。
-仅输出这句话本身。
-""".strip()
-    sentence = generate_from_llm(sent_prompt).strip()
-    if not sentence:
-        raise ValueError("AI 生成句子失败")
 
-    # 2) 让 LLM 选择挖空的词，并给出干扰项（同一词性/同语义域，避免“以上都对”等）
+    _rnd = random.Random(req.seed) if req.seed is not None else random
+    num_gaps = _rnd.randint(2, 3)
+
     gap_prompt = f"""
-基于这句话："{sentence}"，设计一道“选词填空”。
-要求：
-1) 选择一句中的一个词作为空格（'gap_word'），该词语义明确；挖空后句子仍通顺；
-2) 生成 {req.optionCount-1} 个干扰词（'distractors'），与 gap_word 词性/语义域一致，但放入句子后不成立或不自然；
-3) 输出 JSON（仅以下字段）：
+作为一名顶尖的中文教学内容（CSL）设计师，请围绕关键词“{kw}”（HSK{req.hskLevel}，{hskExplain}）设计一道“多项选词填空”题。
+
+要求:
+1. 生成一个包含 {num_gaps} 个空格 (必须用 "___" 标记) 的完整句子。
+2. 为这 {num_gaps} 个空格，分别提供 1 个唯一的正确词和 3 个词性/语义完全不相近相近的干扰词。
+3. 句子需自然、连贯，且与关键词 "{kw}" 相关。
+4. 严格按照以下 JSON 格式输出，不要任何解释：
 {{
-  "gap_word": "……",
-  "distractors": ["……","……", ...]   // 恰好 {req.optionCount-1} 个
+  "sentence_with_blanks": "我___去___了，...",
+  "gaps": [
+    {{
+      "blank_index": 0,
+      "correct_word": "昨天",
+      "distractors": ["历史", "地理", "天气"]
+    }},
+    {{
+      "blank_index": 1,
+      "correct_word": "公园",
+      "distractors": ["班级", "小狗", "键盘"]
+    }}
+    // (如果 num_gaps=3, 则还有第三个对象)
+  ]
 }}
-不要任何解释。
 """.strip()
+
+
     raw = generate_from_llm(gap_prompt).strip()
+    
     try:
         obj = json.loads(raw)
-        gap_word = str(obj["gap_word"]).strip()
-        distractors = [str(x).strip() for x in obj["distractors"]]
-        if not gap_word:
-            raise ValueError("gap_word 为空")
-        if not isinstance(distractors, list) or len(distractors) != (req.optionCount - 1):
-            raise ValueError("干扰项数量不匹配")
-        # 去重 & 防止把相同词作为干扰项
-        all_words = [gap_word] + distractors
-        if len(set(all_words)) != len(all_words):
-            raise ValueError("选项存在重复词语，请重试生成")
+        sentence_with_blanks = str(obj["sentence_with_blanks"]).strip()
+        gaps_data = obj["gaps"]
+        if not sentence_with_blanks or len(gaps_data) != num_gaps:
+            raise ValueError("LLM 返回的 Gaps 数量不匹配或句子为空")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM 返回的挖空JSON解析失败: {e}")
+        raise HTTPException(status_code=500, detail=f"LLM 返回的多空JSON解析失败: {e}")
 
-    # 3) 构造“带空格”的句子（仅替换第一次出现的 gap_word）
-    #    如果句子里不存在该词（偶发），回退为在句末合适位置插入空格提示
-    if gap_word in sentence:
-        sentence_with_blank = sentence.replace(gap_word, "__", 1)
-    else:
-        # 尽量不破坏句意的回退策略
-        sentence_with_blank = sentence + " __"
 
-    # 4) 计算选项拼音
-    options_texts: List[str] = [gap_word] + distractors
-    pinyins = [to_pinyin_sentence(w) for w in options_texts]
+    
+    final_blanks_list: List[Dict[str, Any]] = []
+    final_correct_answer_map: Dict[str, str] = {}
 
-    # 5) 选项打乱并确定正确标签
-    rnd = random.Random(req.seed) if req.seed is not None else random
-    idxs = list(range(req.optionCount))
-    rnd.shuffle(idxs)
+    for gap in gaps_data:
+        blank_index = int(gap['blank_index'])
+        correct_word = str(gap['correct_word']).strip()
+        distractors = [str(d).strip() for d in gap['distractors']][:3] 
+        
 
-    labels = [chr(ord('A') + i) for i in range(req.optionCount)]
-    options_dict: Dict[str, Dict[str, str]] = {}
-    correct_label: Optional[str] = None
-    for pos, j in enumerate(idxs):
-        lab = labels[pos]
-        word_j = options_texts[j]
-        py_j = pinyins[j]
-        options_dict[lab] = {"text": word_j, "pinyin": py_j}
-        if word_j == gap_word:
-            correct_label = lab
-    if not correct_label:
-        raise RuntimeError("未能确定正确选项标签")
+        options_texts: List[str] = [correct_word] + distractors
+        _rnd.shuffle(options_texts) 
+        
 
-    # 6) 入库（新库）
-    # 6.1 题型
+        labels = [chr(ord('A') + i) for i in range(len(options_texts))]
+        options_dict: Dict[str, Dict[str, str]] = {}
+        correct_label: Optional[str] = None
+        
+        for i, text in enumerate(options_texts):
+            label = labels[i]
+            # 调用同步的 to_pinyin_sentence
+            pinyin = to_pinyin_sentence(text) 
+            options_dict[label] = {"text": text, "pinyin": pinyin}
+            
+            if text == correct_word:
+                correct_label = label
+        
+        if not correct_label:
+            raise RuntimeError(f"未能找到 {correct_word} 对应的 correct_label")
+        
+
+        final_blanks_list.append({
+            "blankIndex": blank_index,
+            "options": options_dict,        
+            "correctAnswer": correct_label  
+        })
+        
+        # 构造成员 (匹配 correctAnswer 结构)
+        final_correct_answer_map[str(blank_index)] = correct_label 
+
+    content_data = {
+        "prompt": "请根据语境，选择最合适的词填空。",
+        "text": sentence_with_blanks,
+        "blanks": final_blanks_list
+    }
+    
+
+    metadata_to_save = {
+        "content": content_data,
+        "correctAnswer": final_correct_answer_map,
+        "keyword": kw,
+        "seed": req.seed,
+    }
+
+
     cur.execute("SELECT id FROM content_new.exercise_types WHERE name=%s;", ("READ_WORD_GAP_FILL",))
     row = cur.fetchone()
     if not row:
-        raise HTTPException(status_code=400, detail="题型 READ_WORD_GAP_FILL 未初始化，请先在 exercise_types 中插入。")
+        raise HTTPException(status_code=400, detail="题型 READ_WORD_GAP_FILL 未初始化。")
     exercise_type_id = row[0]
 
-    # 6.2 （可选）把父题与词库关联：若你的业务需要强制关联到关键词
+    # 5.2 词库（父题关联）
     cur.execute("SELECT id FROM content_new.words WHERE characters=%s;", (kw,))
     word_row = cur.fetchone()
-    word_id = word_row[0] if word_row else None  # 若要强制，改成 if not row: raise ...
+    word_id = word_row[0] if word_row else None 
 
     exercise_id = str(uuid.uuid4())
-    metadata = {
-        "original_sentence": sentence,
-        "gap_word": gap_word,
-        "sentence_with_blank": sentence_with_blank,
-        "options": [{"label": lab, "text": options_dict[lab]["text"], "pinyin": options_dict[lab]["pinyin"]}
-                    for lab in labels],
-        "correct_label": correct_label,
-        "seed": req.seed
-    }
 
     cur.execute(
         """
@@ -1232,23 +1302,19 @@ async def create_reading_gap_fill_exercise(cur, req: ReadingGapFillReq) -> Dict[
         """,
         (
             exercise_id,
-            word_id,  # 允许为空；若想强制，确保 words 里有 keyword，并在上面抛错
+            word_id,
             exercise_type_id,
-            "读句子，选出合适的词填空。",
-            json.dumps(metadata),
+            content_data["prompt"], 
+            json.dumps(metadata_to_save), 
             req.difficulty
         )
     )
 
-    # 7) 返回（可直接渲染）
     return {
-        "exercise_id": exercise_id,
-        "question_type": "阅读·选词填空",
-        "hsk_level": req.hskLevel,
-        "difficulty": req.difficulty,
-        "sentence_with_blank": sentence_with_blank,
-        "options": options_dict,
-        "correct_answer": correct_label
+        "exerciseId": exercise_id,
+        "exerciseType": "READ_WORD_GAP_FILL",
+        "content": content_data,
+        "correctAnswer": final_correct_answer_map
     }
 
 #句子翻译
@@ -1775,22 +1841,12 @@ async def create_word_order_exercise(cur, req: WordOrderReq) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"segment_sentence 执行失败: {e}")
 
-    # 不在期望片段数范围则尝试改写并重切一次
-    if len(segs) < req.minPieces or len(segs) > req.maxPieces:
-        adjust_prompt = f"""
-请改写这句话为更简洁、易于分词的一句中文（8~18字）：
-“{sentence}”
-只输出改写后的句子。
-""".strip()
-        sentence2 = generate_from_llm(adjust_prompt).strip() or sentence
-        segs = [s.strip() for s in segment_sentence(sentence2) if s and s.strip()]
-        sentence = sentence2
     if len(segs) < 2:
         raise HTTPException(status_code=500, detail="切分结果不足以组成连词成句题")
 
-    # 3) 逐词拼音（对每个词片单独算）
+
     def word_pinyin(tok: str) -> str:
-        # 你已有的 to_pinyin_sentence 通常支持整句，这里逐词调用即可
+
         return to_pinyin_sentence(tok)
 
     pieces_original = [
@@ -2293,4 +2349,208 @@ async def create_sentence_order_exercise(cur, req: SentenceOrderReq) -> Dict[str
         "sentence": sentence
     }
 
+#翻译——连词成句
+async def create_translate_word_order_exercise(cur, req: WordOrderReq) -> Dict[str, Any]:
+    kw = (req.keyword or "").strip()
+    if not kw:
+        raise ValueError("keyword 不能为空")
+    hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
 
+
+    prompt = f"""
+请用中文写一句与“{kw}”相关的自然口语化句子，适用于HSK{req.hskLevel}（{hskExplain}），并给出其对应的英文翻译。
+- 长度建议 8~20 字，语序清晰。
+- 仅输出 JSON 格式：
+{{
+  "sentence_cn": "...",
+  "sentence_en": "..."
+}}
+""".strip()
+    
+    raw = generate_from_llm(prompt).strip()
+    try:
+        obj = json.loads(raw)
+        sentence_cn = obj["sentence_cn"].strip()
+        sentence_en = obj["sentence_en"].strip()
+        if not sentence_cn or not sentence_en:
+            raise ValueError("LLM 未返回中文或英文句子")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI 生成句子JSON失败: {e}")
+
+    sentence = sentence_cn
+    translation_prompt = sentence_en
+
+
+    try:
+        segs: List[str] = [s.strip() for s in segment_sentence(sentence) if s and s.strip()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"segment_sentence 执行失败: {e}")
+
+
+    if len(segs) < 2:
+        raise HTTPException(status_code=500, detail="切分结果不足以组成连词成句题")
+
+    pieces_original_text = segs 
+
+  
+    rnd = random.Random(req.seed) if req.seed is not None else random
+    shuffled_texts = pieces_original_text[:] 
+    rnd.shuffle(shuffled_texts)
+    labels = [str(i + 1) for i in range(len(shuffled_texts))]
+    
+
+    words_list: List[Dict[str, str]] = [
+        {"label": labels[i], "word": shuffled_texts[i]}
+        for i in range(len(shuffled_texts))
+    ]
+
+
+    text_to_label_map = {word_obj["word"]: word_obj["label"] for word_obj in words_list}
+
+    answer_order = [text_to_label_map[text] for text in pieces_original_text]
+
+
+    cur.execute("SELECT id FROM content_new.exercise_types WHERE name=%s;", ("TRANSLATE_WORD_ORDER",))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail="题型 TRANSLATE_WORD_ORDER 未初始化。")
+    exercise_type_id = row[0]
+
+    cur.execute("SELECT id FROM content_new.words WHERE characters=%s;", (kw,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail=f"词库中不存在词语：{kw}")
+    word_id = row[0]
+
+    exercise_id = str(uuid.uuid4())
+    
+    metadata = {
+        "keyword": kw,
+        "exercise_id": exercise_id, 
+        "content": {
+            "prompt": "Translate and order with words",
+            "originalSentence": sentence_en,
+            "words": words_list 
+        },
+        "correctAnswer": answer_order,
+        "seed": req.seed
+    }
+    
+    cur.execute("""
+        INSERT INTO content_new.exercises
+            (id, word_id, exercise_type_id, prompt, metadata, difficulty_level)
+        VALUES (%s, %s, %s, %s, %s, %s);
+    """, (
+        exercise_id,
+        word_id,
+        exercise_type_id,
+        "Translate and order with words", 
+        json.dumps(metadata),
+        req.difficulty
+    ))
+
+
+    return {
+        "content": {
+            "prompt": translation_prompt,
+            "originalSentence": sentence_cn,
+            "words": words_list
+        },
+        "correctAnswer": answer_order
+    }
+
+#句子跟读
+async def create_speak_along_exercise(cur, req: SpeakAlongReq) -> Dict[str, Any]:
+    kw = (req.keyword or "").strip()
+    if not kw:
+        raise ValueError("keyword 不能为空")
+    hskExplain = HSK_LEVEL_DESCRIPTIONS.get(req.hskLevel, "无特定描述")
+
+    # 1) 生成句子
+    prompt_sent = f"""
+请用中文写一句与“{kw}”相关的自然口语化句子，适用于HSK{req.hskLevel}（{hskExplain}）。
+- 长度建议 8~20 字，避免专名、生僻字。
+- 仅输出这句话本身。
+""".strip()
+    sentence = generate_from_llm(prompt_sent).strip()
+    if not sentence:
+        raise HTTPException(status_code=500, detail="AI 生成句子失败")
+
+    pinyin = to_pinyin_sentence(sentence)
+
+ 
+    audio_temp_url = generate_voice(sentence)
+    r = requests.get(audio_temp_url, timeout=30)
+    r.raise_for_status()
+    audio_bytes = r.content
+    audio_mime = r.headers.get("Content-Type", "audio/mpeg").split(";")[0]
+    
+ 
+    audio_asset_id = save_audio_asset(cur, audio_bytes, audio_mime)
+
+    # 4) 获取音频的公网 URL
+    cur.execute("SELECT file_url FROM content_new.media_assets WHERE id=%s;", (audio_asset_id,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        raise ValueError("音频保存后未能查询到 file_url")
+    public_audio_url = f"{MEDIA_PUBLIC_BASE}/{row[0]}"
+
+    # 5) 题型/词语外键并落库
+    # 5.1 题型
+    cur.execute("SELECT id FROM content_new.exercise_types WHERE name=%s;", ("SPEAK_FOLLOW",))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail="题型 SPEAK_FOLLOW 未初始化，请先在 exercise_types 中插入。")
+    exercise_type_id = row[0]
+
+    # 5.2 词语（强制）
+    cur.execute("SELECT id FROM content_new.words WHERE characters=%s;", (kw,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail=f"词库中不存在词语：{kw}")
+    word_id = row[0]
+
+    # 5.3 落库 (exercises)
+    exercise_id = str(uuid.uuid4())
+    prompt_text = "请跟着示例音频朗读下列句子。"
+    metadata = {
+        "keyword": kw,
+        "sentence": sentence,
+        "pinyin": pinyin,
+        "audio_asset_id": audio_asset_id,
+        "seed": req.seed
+    }
+    cur.execute("""
+        INSERT INTO content_new.exercises
+            (id, word_id, exercise_type_id, prompt, metadata, difficulty_level)
+        VALUES (%s, %s, %s, %s, %s, %s);
+    """, (
+        exercise_id,
+        word_id,
+        exercise_type_id,
+        prompt_text,
+        json.dumps(metadata),
+        req.difficulty
+    ))
+
+    # 5.4 关联媒体 (exercise_media_assets)
+    cur.execute(
+        """
+        INSERT INTO content_new.exercise_media_assets (exercise_id, media_asset_id, usage_role)
+        VALUES (%s, %s, 'sample_audio'); 
+        """,
+        (exercise_id, audio_asset_id)
+    )
+
+    # 6) 返回 (匹配 ReadAlongResp 格式)
+    return {
+        "exercise_id": exercise_id, # (这个ID会被 ReadAlongResp 自动过滤掉，但 service 返回它是个好习惯)
+        "content": {
+            "prompt": prompt_text,
+            "sentence": sentence,
+            "pinyin": pinyin,
+            "sampleAudioUrl": public_audio_url
+        }
+    }
+
+###共20题型

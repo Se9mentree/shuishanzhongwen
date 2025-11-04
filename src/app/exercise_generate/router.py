@@ -2,13 +2,14 @@ from fastapi import APIRouter, HTTPException
 from app.exercise_generate.schema import (GenerateReq,ListenImageTfResp,MCReq,MCResp,MatchReq,MatchResp,ListenSentenceQAReq,ListenSentenceQAResp,ListenSentenceTfReq,ListenSentenceTfResp,
                                           ReadImageTfReq,ReadImageTfResp,ReadImageMatchReq,ReadImageMatchResp,ReadingDialogMatchReq,ReadingDialogMatchResp,ReadingGapFillReq,ReadingGapFillResp,
                                           SentenceTransReq,SentenceTransResp,ReadSentenceCompChoReq,ReadSentenceCompChoResp,ReadSentenceTfReq,ReadSentenceTfResp,ReadParagraphComprReq,ReadParagraphComprResp,
-                                          WordOrderReq,WordOrderResp,ListenDialogueQAResp,ListenParagraphQAResp,ListenParagraphQAReq,ListenDialogueQAReq,SentenceOrderReq,SentenceOrderResp
+                                          WordOrderReq,WordOrderResp,ListenDialogueQAResp,ListenParagraphQAResp,ListenParagraphQAReq,ListenDialogueQAReq,SentenceOrderReq,SentenceOrderResp,TranslateWordOrderResp,
+                                          SpeakAlongReq,SpeakAlongResp
                                           )
 
 from app.exercise_generate.service import (create_listen_image_match_exercise,create_listen_image_mc_exercise,create_listen_image_tf_exercise,create_listen_sentence_qa_exercise,create_listen_sentence_tf_exercise,
                                            create_read_image_match_exercise,create_read_image_tf_exercise,create_read_paragraph_comprehension_exercise,create_read_sentence_comprehension_choice_exercise,
                                            create_read_sentence_tf_exercise,create_reading_dialog_matching,create_reading_gap_fill_exercise,create_sentence_translation_exercise,create_word_order_exercise,
-                                           create_listen_dialogue_qa_exercise,create_listen_paragraph_qa_exercise,create_sentence_order_exercise)
+                                           create_listen_dialogue_qa_exercise,create_listen_paragraph_qa_exercise,create_sentence_order_exercise,create_translate_word_order_exercise,create_speak_along_exercise)
 from app.utils.util import _db
 
 router=APIRouter()
@@ -437,6 +438,178 @@ async def generate_sentence_order(req:SentenceOrderReq):
         if conn:
             cur.close()
             conn.close()
+
+
+@router.post("/api/generate-v2/translate-word-order", response_model=TranslateWordOrderResp, tags=["Exercise Generation"])
+async def generate_translate_word_order(req: WordOrderReq):
+
+    conn = None
+    try:
+        conn = _db()
+        cur = conn.cursor()
+        
+        result = await create_translate_word_order_exercise(cur, req) 
+        
+        conn.commit()
+        return result
+
+    except (Exception, ValueError) as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"生成'翻译连词成句'题目时发生错误: {str(e)}")
+    finally:
+        if conn:
+            cur.close()
+            conn.close()
+
+
+@router.post("/api/generate-v2/read-along-sentence", response_model=SpeakAlongResp, tags=["Exercise Generation"])
+async def generate_read_along_sentence(req: SpeakAlongReq):
+    """
+    生成 跟读句子 题目 (speak-Along)
+    """
+    conn = None
+    try:
+        conn = _db()
+        cur = conn.cursor()
+        
+        result = await create_speak_along_exercise(cur, req) 
+        
+        conn.commit()
+        return result
+
+    except (Exception, ValueError) as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"生成'跟读句子'题目时发生错误: {str(e)}")
+    finally:
+        if conn:
+            cur.close()
+            conn.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

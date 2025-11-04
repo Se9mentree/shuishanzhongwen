@@ -11,16 +11,12 @@ from .routers import all_routers
 app = FastAPI(title="My App")
 
 
-ALLOWED_ORIGINS = [
-    "http://49.52.27.69:8789",  
-    "http://localhost:8789",
-    "http://127.0.0.1:8789",
-]
+ALLOWED_ORIGINS = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,  
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],            
     allow_headers=["*"],           
 )
@@ -40,6 +36,4 @@ def on_startup():
 
 for r in all_routers:
     app.include_router(r)
-
-
 

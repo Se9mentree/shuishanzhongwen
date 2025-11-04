@@ -1,15 +1,109 @@
 import math
 import random
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
 
 from . import schemas, crud, models
 from .formatter import format_exercises_for_api, build_public_url   # ← 新增 build_public_url
 from app.utils.const import AVERAGE_DURATIONS_PER_TYPE
 
 MAX_QUESTIONS_LIMIT = 50
+
+PRACTICE_SKILL_CONFIG: Dict[schemas.PracticeSkill, Dict[str, Any]] = {
+    schemas.PracticeSkill.listen: {
+        "dimension": schemas.PracticeDimension.listen,
+        "exercise_types": [
+            "LISTEN_IMAGE_TRUE_FALSE",
+            "LISTEN_IMAGE_MC",
+            "LISTEN_SENTENCE_TF",
+            "LISTEN_SENTENCE_QA",
+            "LISTEN_DIALOGUE_QA",
+            "LISTEN_PARAGRAPH_QA",
+            "LISTEN_IMAGE_MATCH",
+        ],
+    },
+    schemas.PracticeSkill.speak: {
+        "dimension": schemas.PracticeDimension.speak,
+        "exercise_types": [
+            "SPEAK_FOLLOW",
+        ],
+    },
+    schemas.PracticeSkill.reading: {
+        "dimension": schemas.PracticeDimension.reading,
+        "exercise_types": [
+            "READ_IMAGE_TRUE_FALSE",
+            "READ_SENTENCE_TF",
+            "READ_SENTENCE_COMPREHENSION_CHOICE",
+            "READ_WORD_GAP_FILL",
+            "READ_IMAGE_MATCH",
+            "READ_DIALOGUE_MATCH",
+            "READ_WORD_ORDER",
+            "READ_PARAGRAPH_COMPREHENSION",
+            "READ_SENTENCE_ORDER",
+        ],
+    },
+    schemas.PracticeSkill.writing: {
+        "dimension": schemas.PracticeDimension.writing,
+        "exercise_types": [
+            "STROKE_ORDER_WRITING",
+        ],
+    },
+    schemas.PracticeSkill.translation: {
+        "dimension": schemas.PracticeDimension.translation,
+        "exercise_types": [
+            "TRANSLATE_WORD_ORDER",
+        ],
+    },
+}
+
+
+def _extract_option_labels(meta: Dict[str, Any]) -> List[str]:
+    """
+    提取 metadata 中的选项标签。
+    仅针对包含 "options": [...] 结构的题目类型。
+    """
+    if not isinstance(meta, dict):
+        return []
+
+    options = meta.get("options")
+    if not isinstance(options, list):
+        return []
+
+    labels: List[str] = []
+    for opt in options:
+        if not isinstance(opt, dict):
+            continue
+        label = opt.get("label")
+        if label is None:
+            continue
+        label_str = str(label).strip()
+        if label_str:
+            labels.append(label_str)
+    return labels
+
+
+def _has_invalid_option_labels(exercise: models.Exercise) -> bool:
+    """
+    判断题目是否存在不合规的选项标签：
+    - 标签重复（忽略大小写）
+    - 全部为数字（如 1/2/3/4）
+    """
+    meta = exercise.meta or {}
+    option_labels = _extract_option_labels(meta)
+    if not option_labels:
+        return False
+
+    normalized_labels = [lab.upper() for lab in option_labels]
+    if len(set(normalized_labels)) != len(normalized_labels):
+        return True
+
+    if all(lab.isdigit() for lab in option_labels):
+        return True
+
+    return False
 
 
 def _calculate_average_duration(requested_types: List[str]) -> float:
@@ -44,10 +138,11 @@ def _reconstruct_composite_exercises(
         # 识别两种需要特殊处理的复合题
         is_matching_child = ex_type_name in MATCHING_TYPES and exercise.parent_exercise_id
         is_comprehension_parent = ex_type_name == COMPREHENSION_TYPE and not exercise.parent_exercise_id
-
-        if is_matching_child or is_comprehension_parent:
+        is_matching_parent = ex_type_name in MATCHING_TYPES and not exercise.parent_exercise_id
+        is_comprehension_child = ex_type_name == COMPREHENSION_TYPE and exercise.parent_exercise_id
+        if is_matching_child or is_comprehension_parent or is_matching_parent or is_comprehension_child:
             # 统一获取父题ID
-            parent_id = exercise.parent_exercise_id if is_matching_child else exercise.id
+            parent_id = exercise.parent_exercise_id if (is_matching_child or is_comprehension_child) else exercise.id
 
             if parent_id in processed_parent_ids:
                 continue
@@ -91,7 +186,6 @@ def _reconstruct_composite_exercises(
                 if not sorted_children:
                     continue
                 
-                # --- 以下是您提供的原始配对题处理逻辑，保持不变 ---
                 parent_meta = parent_exercise.meta or {}
                 seed = parent_meta.get("seed")
                 rnd = random.Random(seed) if seed is not None else random
@@ -142,7 +236,6 @@ def _reconstruct_composite_exercises(
                     else:
                         reconstructed_meta = {"texts": final_left, "images": final_right, "answer_map": answer_map}
 
-                # B) 对话配对
                 elif ex_type_name == "READ_DIALOGUE_MATCH":
                     questions, answers = [], []
                     for sub_ex in sorted_children:
@@ -169,12 +262,14 @@ def _reconstruct_composite_exercises(
                         "answers": answer_map,
                     }
 
-                # 回写父题 meta，并记录
                 parent_exercise.meta = reconstructed_meta
                 reconstructed_list.append(parent_exercise)
 
-        # 普通题（既不是复合题的父题，也不是其子题）直接加入
-        elif not exercise.parent_exercise_id and ex_type_name != COMPREHENSION_TYPE:
+        elif (
+            not exercise.parent_exercise_id and 
+            ex_type_name != COMPREHENSION_TYPE and
+            ex_type_name not in MATCHING_TYPES
+        ):
             reconstructed_list.append(exercise)
 
     return reconstructed_list
@@ -246,3 +341,140 @@ def create_exercise_session(
         "exercises": formatted_exercises,
     }
     return response_data
+
+
+def _fetch_random_exercises_by_type(
+    db: Session,
+    type_name: str,
+    limit: int,
+) -> List[models.Exercise]:
+    if limit <= 0:
+        return []
+
+    query = (
+        db.query(models.Exercise)
+        .join(models.ExerciseType)
+        .options(
+            joinedload(models.Exercise.type),
+            joinedload(models.Exercise.media_links).joinedload(models.ExerciseMediaAsset.media_asset),
+        )
+        .filter(models.ExerciseType.name == type_name)
+        .order_by(func.random())
+        .limit(limit)
+    )
+    return query.all()
+
+
+def get_practice_exercises(
+    db: Session,
+    skills: List[schemas.PracticeSkill],
+    limit: int,
+    base_url: Optional[str] = None,
+) -> Optional[schemas.PracticeResponse]:
+    if limit <= 0 or not skills:
+        return None
+
+    # 收集所有选中 skill 的题型
+    all_exercise_types: List[str] = []
+    for skill in skills:
+        config = PRACTICE_SKILL_CONFIG.get(skill)
+        if config:
+            all_exercise_types.extend(config.get("exercise_types", []))
+
+    # 去重
+    all_exercise_types = list(set(all_exercise_types))
+
+    if not all_exercise_types:
+        return None
+
+    per_type_fetch = max(2, math.ceil(limit / max(len(all_exercise_types), 1)))
+    aggregated: List[models.Exercise] = []
+
+    for type_name in all_exercise_types:
+        aggregated.extend(
+            _fetch_random_exercises_by_type(
+                db=db,
+                type_name=type_name,
+                limit=per_type_fetch,
+            )
+        )
+
+    if not aggregated:
+        return None
+
+    reconstructed_candidates = _reconstruct_composite_exercises(
+        db=db,
+        exercises=aggregated,
+        base_url=base_url,
+    )
+
+    filtered_candidates = [
+        exercise for exercise in reconstructed_candidates
+        if exercise and not _has_invalid_option_labels(exercise)
+    ]
+
+    unique_exercises: Dict[str, models.Exercise] = {}
+    for exercise in filtered_candidates:
+        if not exercise or not exercise.type:
+            continue
+        unique_exercises[str(exercise.id)] = exercise
+
+    if not unique_exercises:
+        return None
+
+    type_buckets: Dict[str, List[models.Exercise]] = {}
+    for exercise in unique_exercises.values():
+        ex_type = exercise.type.name if exercise.type else None
+        if not ex_type:
+            continue
+        type_buckets.setdefault(ex_type, []).append(exercise)
+
+    for bucket in type_buckets.values():
+        random.shuffle(bucket)
+
+    selected: List[models.Exercise] = []
+
+    prioritized_types = [t for t in all_exercise_types if t in type_buckets]
+    random.shuffle(prioritized_types)
+    for ex_type in prioritized_types:
+        if len(selected) >= limit:
+            break
+        bucket = type_buckets.get(ex_type)
+        if bucket:
+            selected.append(bucket.pop())
+
+    if len(selected) < limit:
+        remaining_candidates: List[models.Exercise] = []
+        for bucket in type_buckets.values():
+            remaining_candidates.extend(bucket)
+        random.shuffle(remaining_candidates)
+        for exercise in remaining_candidates:
+            if len(selected) >= limit:
+                break
+            selected.append(exercise)
+
+    if not selected:
+        return None
+
+    formatted_exercises = format_exercises_for_api(
+        selected,
+        base_url=base_url,
+    )
+
+    if not formatted_exercises:
+        return None
+
+    exercise_type_names = sorted({item.exerciseType for item in formatted_exercises})
+
+    # 取第一个 skill 作为主要维度显示（如果需要单个 skill 的 dimension）
+    primary_skill = skills[0] if skills else None
+    config = PRACTICE_SKILL_CONFIG.get(primary_skill) if primary_skill else None
+    dimension = config.get("dimension") if config else schemas.PracticeDimension.listen
+
+    return schemas.PracticeResponse(
+        skills=skills,
+        dimension=dimension,
+        count=len(formatted_exercises),
+        exerciseTypes=exercise_type_names,
+        exercises=formatted_exercises,
+    )

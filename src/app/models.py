@@ -55,18 +55,66 @@ class Attempt(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     person_id = Column(UUID(as_uuid=True), nullable=True)
     exercise_id = Column(UUID(as_uuid=True), nullable=False)
-    exercise_format = Column(Text, nullable=True)
-    exercise_skill = Column(Text, nullable=True)
-    exercise_hsk_level = Column(Integer, nullable=True)
-    exercise_difficulty = Column(Integer, nullable=True)
-    exercise_points = Column(Numeric, nullable=True)
     started_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     submitted_at = Column(TIMESTAMP(timezone=True), nullable=True)
     duration_ms = Column(Integer, nullable=True)
     status = Column(Enum(AttemptStatus, schema='events'), nullable=False, server_default=text("'in_progress'::events.attempt_status"))
-    total_score = Column(Numeric, nullable=True, server_default=text("0"))
-    full_marks = Column(Numeric, nullable=True, server_default=text("0"))
+    total_score = Column(Numeric, nullable=True, server_default=text("0"), comment="做完一题后给用户的奖励积分")
     is_full_correct = Column(Boolean, nullable=True)
     attempt_meta = Column(JSONB, nullable=True, server_default=text("'{}'::jsonb"))
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
+class UserWordPerformance(Base):
+    __tablename__ = "user_word_performance"
+    __table_args__ = {"schema": "events"}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    user_id = Column(UUID(as_uuid=True), ForeignKey("people.users.user_id"), nullable=False)
+    word_id = Column(UUID(as_uuid=True), nullable=False)
+    topic_id = Column(UUID(as_uuid=True), nullable=True)
+    chapter_id = Column(UUID(as_uuid=True), nullable=True)
+    listen = Column(Numeric(5, 2), nullable=True, comment="听力题型分数")
+    speak = Column(Numeric(5, 2), nullable=True, comment="口语题型分数")
+    reading = Column(Numeric(5, 2), nullable=True, comment="阅读题型分数")
+    writing = Column(Numeric(5, 2), nullable=True, comment="写作题型分数")
+    translation = Column(Numeric(5, 2), nullable=True, comment="翻译题型分数")
+    avg = Column(Numeric(5, 2), nullable=True, comment="平均分")
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
+class UserWrongExercise(Base):
+    __tablename__ = "user_wrong_exercises"
+    __table_args__ = {"schema": "events"}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    user_id = Column(UUID(as_uuid=True), ForeignKey("people.users.user_id"), nullable=False)
+    exercise_id = Column(UUID(as_uuid=True), nullable=False, comment="题目ID")
+    word_id = Column(UUID(as_uuid=True), nullable=False)
+    topic_id = Column(UUID(as_uuid=True), nullable=True)
+    chapter_id = Column(UUID(as_uuid=True), nullable=True)
+    exercise_type = Column(Text, nullable=False, comment="题型名称")
+    wrong_count = Column(Integer, nullable=False, server_default=text("1"), comment="错题次数")
+    last_wrong_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), comment="最后一次做错时间")
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
+class LessonProgressStatus(enum.Enum):
+    locked = "locked"
+    in_progress = "in_progress"
+    completed = "completed"
+
+class LessonProgress(Base):
+    __tablename__ = "lesson_progress"
+    __table_args__ = {"schema": "events"}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    user_id = Column(UUID(as_uuid=True), ForeignKey("people.users.user_id"), nullable=False, comment="用户ID")
+    topic_id = Column(UUID(as_uuid=True), nullable=False, comment="主题ID")
+    lesson_id = Column(UUID(as_uuid=True), nullable=False, comment="课程ID")
+    status = Column(Enum(LessonProgressStatus, schema='events'), nullable=False, server_default=text("'in_progress'::events.lesson_progress_status"), comment="课程状态")
+    unlock_date = Column(TIMESTAMP(timezone=True), nullable=True, comment="解锁时间")
+    first_accessed_at = Column(TIMESTAMP(timezone=True), nullable=True, comment="第一次访问时间")
+    completed_at = Column(TIMESTAMP(timezone=True), nullable=True, comment="完成时间")
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())

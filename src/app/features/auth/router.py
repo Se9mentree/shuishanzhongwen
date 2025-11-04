@@ -1,5 +1,7 @@
 # app/features/auth/router.py
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from sqlalchemy.orm import Session
 from fastapi.security import OAuth2PasswordBearer
 from app.database import get_db
@@ -17,15 +19,15 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     """
     用户登录接口
 
-    - **user_name**: 用户名
+    - **phone**: 手机号码
     - **password**: 密码
 
     返回访问令牌、会话ID和用户信息
     """
     # 验证用户
-    user = AuthService.authenticate_user(db, request.user_name, request.password)
+    user = AuthService.authenticate_user(db, request.phone, request.password)
     if not user:
-        return {"code": 0, "message": "用户名或密码错误", "data": None}
+        return {"code": 0, "message": "手机号或密码错误", "data": None}
 
     # 生成 token
     token = AuthService.generate_access_token(user.user_id, user.user_name)
@@ -50,37 +52,88 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/logout", response_model=ResponseModel, summary="用户登出")
-def logout(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+def logout(
+    authorization: Optional[str] = Header(
+        default=None,
+        description="标准 Authorization 头，格式为 'Bearer <token>'"
+    ),
+    token: Optional[str] = Query(
+        default=None,
+        description="可选显式 token，用于 Swagger 调试"
+    ),
+    db: Session = Depends(get_db)
+):
     """
     用户登出接口
 
     需要在 Authorization header 中提供有效的 Bearer token
     """
-    success = AuthService.logout_user(db, token)
+    token_value: Optional[str] = None
+
+    if authorization:
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token_value = parts[1]
+        else:
+            raise HTTPException(status_code=401, detail="无效的 Authorization 格式，应为 'Bearer <token>'")
+
+    if not token_value and token:
+        token_value = token
+
+    if not token_value:
+        raise HTTPException(status_code=401, detail="未提供 token")
+
+    success = AuthService.logout_user(db, token_value)
     if not success:
         return {"code": 0, "message": "Token 无效或已登出", "data": None}
 
     return {"code": 1, "message": "登出成功", "data": None}
 
 
+# noinspection PyUnusedLocal
 @router.get("/me", response_model=ResponseModel, summary="获取当前用户信息")
 def get_current_user_info(
-    token: str = Depends(oauth2_scheme),
+    authorization: Optional[str] = Header(
+        default=None,
+        description="标准的 Authorization 头，格式为 'Bearer <token>'"
+    ),
+    token: Optional[str] = Query(
+        default=None,
+        description="可选显式 token，用于 Swagger 调试"
+    ),
     db: Session = Depends(get_db)
 ):
     """
-    获取当前登录用户信息
-
-    需要在 Authorization header 中提供有效的 Bearer token
+    获取当前登录用户信息。
+    使用 Authorization 头中的 Bearer token。
     """
-    session = AuthService.get_user_by_token(db, token)
+    token_value = None
+
+    if authorization:
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token_value = parts[1]
+        else:
+            raise HTTPException(status_code=401, detail="无效的 Authorization 格式，应为 'Bearer <token>'")
+
+    if not token_value and token:
+        token_value = token
+
+    if not token_value:
+        raise HTTPException(status_code=401, detail="未提供 token")
+
+    session = AuthService.get_user_by_token(db, token_value)
     if not session:
         raise HTTPException(status_code=401, detail="未认证或已登出")
+
+    profile = AuthService.get_user_profile(db, session.user_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="未找到用户")
 
     return {
         "code": 1,
         "message": "success",
-        "data": {"user_id": str(session.user_id)}
+        "data": profile
     }
 
 

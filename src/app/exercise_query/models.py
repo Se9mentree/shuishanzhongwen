@@ -1,9 +1,8 @@
 import uuid
-from sqlalchemy import Column, String, ForeignKey, JSON,SmallInteger,Integer
+from sqlalchemy import Column, String, ForeignKey, JSON, SmallInteger, Integer, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
 from app.database import Base 
-from sqlalchemy import SmallInteger, Text 
 
 SCHEMA="content_new"
 
@@ -14,6 +13,7 @@ class Word(Base):
     characters = Column(String(100), nullable=False, unique=True)
     pinyin = Column(String(255))
     translation = Column(Text)
+    audio_url = Column(Text, nullable=True) # <--- [新增] 添加 audio_url 列
     hsk_level = Column(SmallInteger)
     exercises = relationship("Exercise", back_populates="word")
     lessons = relationship("LessonWord", back_populates="word")
@@ -33,6 +33,7 @@ class Topic(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     phase_id = Column(UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.phases.id"), nullable=False)
     topic_name = Column(String(255), nullable=False)
+    topic_order = Column(Integer, nullable=False, default=0)
     
     # 定义与 Phase 的多对一关系
     phase = relationship("Phase", back_populates="topics")
@@ -45,7 +46,8 @@ class Lesson(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     topic_id = Column(UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.topics.id"), nullable=False)
     lesson_name = Column(String(255), nullable=False)
-    
+    display_order = Column(Integer, nullable=False, default=0)
+
     # 定义与 Topic 的多对一关系
     topic = relationship("Topic", back_populates="lessons")
     word_links = relationship("LessonWord", back_populates="lesson")
@@ -55,6 +57,7 @@ class Phase(Base):
     __table_args__ = {"schema": SCHEMA} 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False, unique=True)
+    display_order = Column(Integer, nullable=False, default=0)
 
     topics = relationship("Topic", back_populates="phase")
 

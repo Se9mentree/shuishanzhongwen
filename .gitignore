@@ -1,3 +1,8 @@
 .env
 media/
 postgresql/
+backups/
+src/app_1/
+src/app_backup/
+src/app_backup1028/
+src/app_backup1029/

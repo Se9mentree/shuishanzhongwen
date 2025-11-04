@@ -10,5 +10,6 @@ Features module - 功能模块
 
 from .auth import router as auth_router
 from .user import router as user_router
+from .lesson_progress import lesson_progress_router
 
-__all__ = ["auth_router", "user_router"]
+__all__ = ["auth_router", "user_router", "lesson_progress_router"]
