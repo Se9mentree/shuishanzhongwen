@@ -15,6 +15,7 @@ class User(Base):
     reg_time = Column(TIMESTAMP(timezone=True), server_default=func.now())
     phone = Column(Text, nullable=True)
     email = Column(Text, nullable=True)
+    avatar = Column(Text, nullable=True)
     # init_cn_level = Column(Integer, nullable=True)
     init_cn_level=Column(Integer,nullable=False,server_default="0")  # 初始中文水平，默认0
     password_hash = Column(Text, nullable=False)  # 认证所需字段

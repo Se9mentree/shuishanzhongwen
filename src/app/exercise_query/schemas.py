@@ -203,7 +203,7 @@ class PracticeDimension(str, Enum):
 
 class PracticeResponse(BaseModel):
     skills: List[PracticeSkill]
-    dimension: PracticeDimension
+    dimensions: List[PracticeDimension]
     count: int
     exerciseTypes: List[str]
     exercises: List[Annotated[AnyExercise, Field(discriminator='exerciseType')]]

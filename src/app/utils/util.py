@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field,validator
 from PIL import Image
 import random
 
-from app.utils.const import DATABASE_URL,MEDIA_ROOT,MEDIA_PUBLIC_BASE,LLM_API_KEY,APP_ID,QUESTION_TYPE_MAPPING
+from app.utils.const import DATABASE_URL,MEDIA_ROOT,MEDIA_PUBLIC_BASE,LLM_API_KEY,APP_ID
 
 PUNCTUATION_REGEX = re.compile(
     r"^[!" + re.escape(r"\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~") + r"\u3000-\u303f\uff00-\uffef\u2000-\u206f]+$"
@@ -289,29 +289,5 @@ def segment_paragraph_to_sentences(paragraph: str) -> List[str]:
         sentences.append(parts[-1].strip())
 
     return sentences
-
-
-def convert_chinese_types_to_english(chinese_types: List[str]) -> List[str]:
-    """
-    将用户输入的中文题型名称转换为数据库中的英文题型标识符。
-
-    参数：
-    - chinese_types: 中文题型列表，例如 ['听', '读']
-
-    返回：
-    - 对应的英文题型列表，例如 ['LISTEN_IMAGE_TRUE_FALSE', 'LISTEN_IMAGE_MC', ...]
-
-    示例：
-    >>> convert_chinese_types_to_english(['听'])
-    ['LISTEN_IMAGE_TRUE_FALSE', 'LISTEN_IMAGE_MC', 'LISTEN_IMAGE_MATCH', ...]
-    """
-    english_types = []
-
-    for chinese_type in chinese_types:
-        if chinese_type in QUESTION_TYPE_MAPPING:
-            # 将该中文题型对应的所有英文类型加入列表
-            english_types.extend(QUESTION_TYPE_MAPPING[chinese_type])
-
-    return english_types
 
 
