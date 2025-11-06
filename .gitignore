@@ -6,3 +6,8 @@ src/app_1/
 src/app_backup/
 src/app_backup1028/
 src/app_backup1029/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
