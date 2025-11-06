@@ -1,5 +1,5 @@
 # app/features/user/schemas.py
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional, List, Any, Dict
 
 
@@ -12,6 +12,27 @@ class RegisterRequest(BaseModel):
     phone: str
     email: Optional[EmailStr] = None
     init_cn_level: Optional[int] = None
+
+
+class UpdateUserProfileRequest(BaseModel):
+    """更新用户信息请求"""
+    user_name: Optional[str] = Field(None, description="用户昵称，空值时不更新")
+    email: Optional[str] = Field(None, description="用户邮箱，空值时不更新")
+    phone: Optional[str] = Field(None, description="用户电话号码，空值时不更新")
+    country: Optional[str] = Field(None, description="国家/地区，空值时不更新")
+    job: Optional[str] = Field(None, description="职位/工作，空值时不更新")
+
+    @field_validator("user_name", "email", "phone", "country", "job", mode="before")
+    @classmethod
+    def normalize_optional_str(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if not trimmed:
+                return None
+            return trimmed
+        return value
 
 
 class SubmissionItem(BaseModel):

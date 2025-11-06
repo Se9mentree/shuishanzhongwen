@@ -371,26 +371,38 @@ def get_practice_exercises(
     limit: int,
     base_url: Optional[str] = None,
 ) -> Optional[schemas.PracticeResponse]:
-    if limit <= 0 or not skills:
+    if limit <= 0:
         return None
 
-    # 收集所有选中 skill 的题型
-    all_exercise_types: List[str] = []
+    if not skills:
+        return None
+
+    normalized_skills: List[schemas.PracticeSkill] = []
     for skill in skills:
-        config = PRACTICE_SKILL_CONFIG.get(skill)
-        if config:
-            all_exercise_types.extend(config.get("exercise_types", []))
+        if skill not in normalized_skills and skill in PRACTICE_SKILL_CONFIG:
+            normalized_skills.append(skill)
 
-    # 去重
-    all_exercise_types = list(set(all_exercise_types))
-
-    if not all_exercise_types:
+    if not normalized_skills:
         return None
 
-    per_type_fetch = max(2, math.ceil(limit / max(len(all_exercise_types), 1)))
+    skill_configs: List[Dict[str, Any]] = [
+        PRACTICE_SKILL_CONFIG[skill] for skill in normalized_skills
+    ]
+
+    exercise_types: List[str] = []
+    for config in skill_configs:
+        exercise_types.extend(config.get("exercise_types", []))
+
+    # 去重同时保持声明顺序
+    exercise_types = list(dict.fromkeys(exercise_types))
+
+    if not exercise_types:
+        return None
+
+    per_type_fetch = max(2, math.ceil(limit / max(len(exercise_types), 1)))
     aggregated: List[models.Exercise] = []
 
-    for type_name in all_exercise_types:
+    for type_name in exercise_types:
         aggregated.extend(
             _fetch_random_exercises_by_type(
                 db=db,
@@ -434,7 +446,7 @@ def get_practice_exercises(
 
     selected: List[models.Exercise] = []
 
-    prioritized_types = [t for t in all_exercise_types if t in type_buckets]
+    prioritized_types = [t for t in exercise_types if t in type_buckets]
     random.shuffle(prioritized_types)
     for ex_type in prioritized_types:
         if len(selected) >= limit:
@@ -466,14 +478,17 @@ def get_practice_exercises(
 
     exercise_type_names = sorted({item.exerciseType for item in formatted_exercises})
 
-    # 取第一个 skill 作为主要维度显示（如果需要单个 skill 的 dimension）
-    primary_skill = skills[0] if skills else None
-    config = PRACTICE_SKILL_CONFIG.get(primary_skill) if primary_skill else None
-    dimension = config.get("dimension") if config else schemas.PracticeDimension.listen
+    dimensions: List[schemas.PracticeDimension] = list(
+        dict.fromkeys(
+            config["dimension"]
+            for config in skill_configs
+            if config.get("dimension") is not None
+        )
+    )
 
     return schemas.PracticeResponse(
-        skills=skills,
-        dimension=dimension,
+        skills=normalized_skills,
+        dimensions=dimensions,
         count=len(formatted_exercises),
         exerciseTypes=exercise_type_names,
         exercises=formatted_exercises,

@@ -1,6 +1,7 @@
+from typing import List
+
 from fastapi import APIRouter, HTTPException, Depends, Request, Query
 from sqlalchemy.orm import Session
-from typing import List
 from . import schemas
 from . import service
 from app.database import get_db
@@ -56,20 +57,23 @@ async def get_exercises(
 )
 async def get_practice(
     req: Request,
-    skills: List[schemas.PracticeSkill] = Query(..., description="练习维度列表：听/说/读/写/译，支持多选"),
-    duration: int = Query(10, ge=1, le=50, description="返回的题目数量"),
+    skills: List[schemas.PracticeSkill] = Query(
+        ...,
+        alias="skill",
+        description="练习维度：听/说/读/写/译。重复传参以实现多选，例如 ?skill=听&skill=读",
+    ),
+    limit: int = Query(10, ge=1, le=50, description="返回的题目数量"),
     db: Session = Depends(get_db),
 ):
     """
-    根据指定的练习维度（听/说/读/写/译）随机返回指定数量的题目列表。
-    支持多个维度的组合查询。
+    根据指定的一个或多个练习维度（听/说/读/写/译）随机返回指定数量的题目列表。
     """
     base_url = str(req.base_url)
 
     practice = service.get_practice_exercises(
         db=db,
         skills=skills,
-        limit=duration,
+        limit=limit,
         base_url=base_url,
     )
 

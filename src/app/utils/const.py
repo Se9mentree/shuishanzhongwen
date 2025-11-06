@@ -1,45 +1,4 @@
 import os
-
-# 题型中文到英文的映射字典
-# 将用户输入的中文题型名称转换为数据库中的英文题型标识符
-QUESTION_TYPE_MAPPING = {
-    # 听力题型 (LISTEN)
-    "听": [
-        "LISTEN_IMAGE_TRUE_FALSE",
-        "LISTEN_IMAGE_MC",
-        "LISTEN_IMAGE_MATCH",
-        "LISTEN_SENTENCE_QA",
-        "LISTEN_SENTENCE_TF",
-        "LISTEN_DIALOGUE_QA",
-        "LISTEN_PARAGRAPH_QA"
-    ],
-
-    # 阅读题型 (READ)
-    "读": [
-        "READ_IMAGE_TRUE_FALSE",
-        "READ_IMAGE_MATCH",
-        "READ_DIALOGUE_MATCH",
-        "READ_WORD_GAP_FILL",
-        "READ_SENTENCE_TRANSLATION",
-        "READ_SENTENCE_COMPREHENSION_CHOICE",
-        "READ_SENTENCE_TF",
-        "READ_PARAGRAPH_COMPREHENSION",
-        "READ_WORD_ORDER",
-        "READ_SENTENCE_ORDER"
-    ],
-
-    # 口语题型 (SPEAK)
-    "说": [
-        "SPEAK_FOLLOW"
-    ],
-
-    # 写作题型 (WRITE)
-    "写": [
-        "STROKE_ORDER_WRITING",
-        "TRANSLATE_WORD_ORDER"
-    ]
-}
-
 AVERAGE_DURATIONS_PER_TYPE = {
     "LISTEN_IMAGE_TRUE_FALSE": 20,
     "LISTEN_IMAGE_MC": 25,
@@ -53,7 +12,7 @@ AVERAGE_DURATIONS_PER_TYPE = {
     "READ_SENTENCE_TRANSLATION": 20,
     "READ_SENTENCE_COMPREHENSION_CHOICE": 45,
     "READ_SENTENCE_TF": 40,
-    "READ_PARAGRAPH_COMPREHENSION": 180,
+    "READ_PARAGRAPH_COMPREHENSION": 180, 
     "READ_WORD_ORDER": 30,
     "TRANSLATE_WORD_ORDER":30,
     "SPEAK_FOLLOW":20,

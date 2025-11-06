@@ -1,22 +1,131 @@
 # app/features/user/router.py
-from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
+import io
+from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request, UploadFile, File
 from typing import Optional
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.schemas import ResponseModel
 from app.core.dependencies import get_current_user_id
 from app.core.security import verify_token
+from PIL import Image, UnidentifiedImageError
 from .schemas import (
     RegisterRequest,
     SubmitAnswersRequest,
     UnlockTopicRequest,
     WeakTypeRecommendationData,
+    UpdateUserProfileRequest,
 )
 from .service import UserService
 import uuid
 
 
 router = APIRouter(prefix="/user", tags=["用户"])
+
+MAX_AVATAR_SIZE = 10 * 1024 * 1024  # 10 MB
+ALLOWED_IMAGE_FORMATS = {
+    "jpeg": ".jpg",
+    "jpg": ".jpg",
+    "png": ".png",
+    "gif": ".gif",
+    "webp": ".webp",
+}
+
+
+@router.post("/avatar", response_model=ResponseModel, summary="上传用户头像")
+async def upload_avatar(
+    avatar: UploadFile = File(..., description="头像图片文件"),
+    user_id: uuid.UUID = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """
+    上传并更新用户头像。
+    - 文件大小不超过 10 MB
+    - 支持 jpg/jpeg、png、gif、webp 等常见格式
+    """
+    file_bytes = await avatar.read()
+    await avatar.close()
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="未检测到上传的文件内容")
+
+    if len(file_bytes) > MAX_AVATAR_SIZE:
+        raise HTTPException(status_code=400, detail="头像文件大小不能超过 10 MB")
+
+    try:
+        with Image.open(io.BytesIO(file_bytes)) as image:
+            image_format = (image.format or "").lower()
+            image.verify()
+    except (UnidentifiedImageError, OSError):
+        raise HTTPException(status_code=400, detail="请上传有效的图片文件")
+
+    if image_format not in ALLOWED_IMAGE_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail="不支持的图片格式，仅支持 jpg/jpeg、png、gif、webp",
+        )
+
+    extension = ALLOWED_IMAGE_FORMATS[image_format]
+
+    avatar_url = UserService.save_user_avatar(
+        db=db,
+        user_id=user_id,
+        image_bytes=file_bytes,
+        extension=extension,
+    )
+
+    if not avatar_url:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    return {
+        "code": 1,
+        "message": "头像上传成功",
+        "data": {
+            "avatar": avatar_url,
+        },
+    }
+
+
+@router.put("/profile", response_model=ResponseModel, summary="更新用户个人信息")
+def update_profile(
+    request: UpdateUserProfileRequest,
+    user_id: uuid.UUID = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """
+    更新用户的基础信息。
+
+    - **user_name**: 用户昵称（可选，空值不更新）
+    - **email**: 用户邮箱（可选，空值不更新）
+    - **phone**: 用户手机号（可选，空值不更新）
+    - **country**: 国家/地区（可选，空值不更新）
+    - **job**: 职位/工作（可选，空值不更新）
+    """
+    updated_user = UserService.update_user_profile(
+        db=db,
+        user_id=user_id,
+        user_name=request.user_name,
+        email=request.email,
+        phone=request.phone,
+        country=request.country,
+        job=request.job,
+    )
+
+    if not updated_user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    return {
+        "code": 1,
+        "message": "用户信息更新成功",
+        "data": {
+            "user_id": str(updated_user.user_id),
+            "user_name": updated_user.user_name,
+            "email": updated_user.email,
+            "phone": updated_user.phone,
+            "country": updated_user.country,
+            "job": updated_user.job,
+            "avatar": updated_user.avatar,
+        },
+    }
 
 
 @router.post("/register", response_model=ResponseModel, summary="用户注册")
@@ -49,6 +158,7 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
             "job": request.job,
             "phone": request.phone,
             "email": request.email,
+            "avatar": UserService.DEFAULT_AVATAR_URL,
             "init_cn_level": request.init_cn_level if request.init_cn_level is not None else 1,
             "points": 0
         }
@@ -59,7 +169,8 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
         "message": "注册成功",
         "data": {
             "user_id": str(user.user_id),
-            "user_name": user.user_name
+            "user_name": user.user_name,
+            "avatar": user.avatar,
         }
     }
 

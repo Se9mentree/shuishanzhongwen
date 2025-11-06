@@ -1,4 +1,5 @@
 # app/features/user/service.py
+import os
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 from app import models
@@ -19,10 +20,16 @@ from datetime import datetime
 from decimal import Decimal
 import uuid
 import json
+from app.utils.const import MEDIA_ROOT, MEDIA_PUBLIC_BASE
+
+
+DEFAULT_AVATAR_URL = "http://49.52.27.69:8000/media/avatars/2025/11/05/avata.jpg"
 
 
 class UserService:
     """用户服务"""
+
+    DEFAULT_AVATAR_URL = DEFAULT_AVATAR_URL
 
     @staticmethod
     def get_user_by_username(db: Session, user_name: str) -> Optional[models.User]:
@@ -112,6 +119,7 @@ class UserService:
             job=user_extra.get("job"),
             phone=user_extra.get("phone"),
             email=user_extra.get("email"),
+            avatar=user_extra.get("avatar") or DEFAULT_AVATAR_URL,
             init_cn_level=user_extra.get("init_cn_level", 1),
             points=user_extra.get("points", 0)
         )
@@ -124,6 +132,81 @@ class UserService:
         LessonProgressService.initialize_first_lessons_for_new_user(db, user.user_id)
 
         return user
+
+    @staticmethod
+    def update_user_profile(
+        db: Session,
+        user_id: uuid.UUID,
+        user_name: Optional[str] = None,
+        email: Optional[str] = None,
+        phone: Optional[str] = None,
+        country: Optional[str] = None,
+        job: Optional[str] = None,
+    ) -> Optional[models.User]:
+        """
+        更新用户个人信息。
+        仅当可选字段提供非空值时才会更新对应字段。
+        """
+        user = db.query(models.User).filter(models.User.user_id == user_id).first()
+        if not user:
+            return None
+
+        if user_name is not None:
+            user.user_name = user_name
+        if email is not None:
+            user.email = email
+        if phone is not None:
+            user.phone = phone
+        if country is not None:
+            user.country = country
+        if job is not None:
+            user.job = job
+
+        db.commit()
+        db.refresh(user)
+        return user
+
+    @staticmethod
+    def save_user_avatar(
+        db: Session,
+        user_id: uuid.UUID,
+        image_bytes: bytes,
+        extension: str,
+    ) -> Optional[str]:
+        """
+        保存用户头像并返回可公开访问的 URL。
+        """
+        user = db.query(models.User).filter(models.User.user_id == user_id).first()
+        if not user:
+            return None
+
+        safe_extension = extension if extension.startswith(".") else f".{extension}"
+        now = datetime.utcnow()
+        rel_dir = os.path.join(
+            "avatars",
+            now.strftime("%Y"),
+            now.strftime("%m"),
+            now.strftime("%d"),
+        )
+        filename = f"{uuid.uuid4().hex}{safe_extension}"
+        rel_path = os.path.join(rel_dir, filename)
+        abs_path = os.path.join(MEDIA_ROOT, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
+        with open(abs_path, "wb") as avatar_file:
+            avatar_file.write(image_bytes)
+
+        rel_url = rel_path.replace(os.sep, "/")
+        base = (MEDIA_PUBLIC_BASE or "").rstrip("/")
+        if base:
+            avatar_url = f"{base}/{rel_url}"
+        else:
+            avatar_url = f"/{rel_url}"
+
+        user.avatar = avatar_url
+        db.commit()
+        db.refresh(user)
+        return avatar_url
 
     @staticmethod
     def create_attempt(db: Session, attempt_data: Dict[str, Any]) -> models.Attempt:
@@ -552,18 +635,12 @@ class UserService:
         if top_n <= 0 or per_type_limit <= 0:
             return []
 
-        # 排除的题型（暂时）
-        excluded_exercise_types = ["READ_DIALOGUE_MATCH"]
-
         type_stats = (
             db.query(
                 models.UserWrongExercise.exercise_type,
                 func.sum(models.UserWrongExercise.wrong_count).label("total_wrong")
             )
-            .filter(
-                models.UserWrongExercise.user_id == user_id,
-                ~models.UserWrongExercise.exercise_type.in_(excluded_exercise_types)
-            )
+            .filter(models.UserWrongExercise.user_id == user_id)
             .group_by(models.UserWrongExercise.exercise_type)
             .order_by(func.sum(models.UserWrongExercise.wrong_count).desc())
             .limit(top_n)
@@ -642,15 +719,9 @@ class UserService:
         """
         获取用户错题推荐，仅返回题目和答案信息。
         """
-        # 排除的题型（暂时）
-        excluded_exercise_types = ["READ_DIALOGUE_MATCH"]
-
         wrong_records = (
             db.query(models.UserWrongExercise)
-            .filter(
-                models.UserWrongExercise.user_id == user_id,
-                ~models.UserWrongExercise.exercise_type.in_(excluded_exercise_types)
-            )
+            .filter(models.UserWrongExercise.user_id == user_id)
             .order_by(models.UserWrongExercise.wrong_count.desc(), models.UserWrongExercise.updated_at.desc())
             .limit(limit)
             .all()

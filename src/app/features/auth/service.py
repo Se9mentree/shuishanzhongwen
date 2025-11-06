@@ -173,6 +173,7 @@ class AuthService:
         return {
             "user_id": str(user.user_id),
             "user_name": user.user_name,
+            "avatar": user.avatar,
             "points": user.points,
             "registered_at": user.reg_time.isoformat() if user.reg_time else None,
             "days_studied": days_studied,

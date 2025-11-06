@@ -45,7 +45,8 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
             "user_info": {
                 "user_id": str(user.user_id),
                 "user_name": user.user_name,
-                "points": user.points
+                "points": user.points,
+                "avatar": user.avatar,
             }
         }
     }
